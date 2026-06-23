@@ -1,0 +1,848 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<title>Partnership Ledger</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap" rel="stylesheet">
+<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+<style>html,body{margin:0;background:#f7f4ee}</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useMemo } = React;
+
+
+
+/* =========================================================================
+   Partnership Tracker — Mohamed (80%) & Ahmed (20%)
+   Single-file React app. Mobile-first. Data persists via the storage layer
+   below. Swap the storage layer for Supabase to sync across devices
+   (instructions provided separately).
+   ========================================================================= */
+
+/* ----------------------------- Storage layer -----------------------------
+   Saved in this browser via localStorage. To enable real sync across devices,
+   replace loadAll/saveAll with Supabase calls (see setup guide).
+-------------------------------------------------------------------------- */
+const STORAGE_KEY = "partnership_data_v1";
+
+const DEFAULT_DATA = {
+  settings: { p1: "Mohamed", p2: "Ahmed", share2: 0.2, rate: 52 },
+  company1: [], // {id,date,desc,income,expense,distributed,paidToAhmed,notes}
+  company2: [], // {id,name,buy,current,status,sale,installment,bankRemaining,paidToAhmed,notes}
+  company2debt: { total: 0, paidBack: 0 },
+  company3: [], // {id,date,desc,profit,fromPocket,paidToAhmed,returnedToMohamed,notes}
+  realestate: [], // {id,date,desc,installment,paidToAhmed,notes}
+  private: [], // {id,date,desc,whoPaid,forWhom,amount,settled,notes}
+};
+
+/* ====== SUPABASE SYNC — paste your two keys below ====== */
+const SUPABASE_URL = "sb_publishable_zhryO5D1io9JfclGACkrEg_RmxVHImp";   // e.g. https://xxxx.supabase.co
+const SUPABASE_KEY = "sb_publishable_zhryO5D1io9JfclGACkrEg_RmxVHImp";
+const ROW_KEY = "shared";
+const SYNC_ON = SUPABASE_URL.indexOf("supabase.co") !== -1 && SUPABASE_KEY.length > 20;
+
+async function loadAll() {
+  if (SYNC_ON) {
+    try {
+      const res = await fetch(
+        SUPABASE_URL + "/rest/v1/app_state?key=eq." + ROW_KEY + "&select=data",
+        { headers: { apikey: SUPABASE_KEY, Authorization: "Bearer " + SUPABASE_KEY } }
+      );
+      const rows = await res.json();
+      if (rows && rows[0] && rows[0].data) {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(rows[0].data));
+        return { ...DEFAULT_DATA, ...rows[0].data };
+      }
+    } catch (e) { console.error("cloud load failed, using local", e); }
+  }
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (raw) return { ...DEFAULT_DATA, ...JSON.parse(raw) };
+  } catch (e) { /* first run */ }
+  return JSON.parse(JSON.stringify(DEFAULT_DATA));
+}
+
+async function saveAll(data) {
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(data)); } catch (e) {}
+  if (SYNC_ON) {
+    try {
+      await fetch(SUPABASE_URL + "/rest/v1/app_state?on_conflict=key", {
+        method: "POST",
+        headers: {
+          apikey: SUPABASE_KEY,
+          Authorization: "Bearer " + SUPABASE_KEY,
+          "Content-Type": "application/json",
+          Prefer: "resolution=merge-duplicates",
+        },
+        body: JSON.stringify({ key: ROW_KEY, data }),
+      });
+    } catch (e) { console.error("cloud save failed", e); }
+  }
+}
+
+/* ------------------------------- Helpers -------------------------------- */
+const uid = () => Math.random().toString(36).slice(2, 10);
+const n = (v) => (isNaN(parseFloat(v)) ? 0 : parseFloat(v));
+const eur = (v) =>
+  (v < 0 ? "-" : "") +
+  "€" +
+  Math.abs(v).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const egp = (v) =>
+  Math.round(v).toLocaleString("en-US") + " EGP";
+
+/* ------------------------------- Palette --------------------------------
+   Subject: two partners settling money across ventures. Direction: a calm
+   "ledger" feel — ink navy, warm paper, a single brass accent for the number
+   that matters, green/red only for owed/paid. Mono for figures.
+-------------------------------------------------------------------------- */
+const css = `
+:root{
+  --ink:#13233b; --ink2:#2c3e57; --paper:#f7f4ee; --card:#ffffff;
+  --line:#e4ddd0; --brass:#b08322; --brass-d:#8a6512;
+  --pos:#1c7a44; --pos-bg:#e3f1e7; --neg:#b23021; --neg-bg:#f8e2de;
+  --muted:#7b8494; --shadow:0 1px 3px rgba(19,35,59,.08),0 6px 20px rgba(19,35,59,.06);
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body,#root{margin:0;height:100%}
+body{background:var(--paper);color:var(--ink);
+  font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+  font-feature-settings:'tnum' 1;}
+.app{max-width:560px;margin:0 auto;padding:0 0 96px;min-height:100%}
+.mono{font-variant-numeric:tabular-nums;font-family:'SF Mono',ui-monospace,Menlo,Consolas,monospace}
+
+/* top bar */
+.top{position:sticky;top:0;z-index:20;background:var(--ink);color:#fff;
+  padding:14px 18px 12px;border-bottom:3px solid var(--brass)}
+.top h1{margin:0;font-size:16px;font-weight:700;letter-spacing:.2px}
+.top p{margin:2px 0 0;font-size:12px;color:#aeb9cb}
+.sync{position:absolute;right:14px;top:14px;font-size:11px;color:#aeb9cb;
+  display:flex;align-items:center;gap:5px}
+.dot{width:7px;height:7px;border-radius:50%;background:#5a6b86}
+.dot.on{background:#46c277}
+
+/* tabs */
+.tabs{display:flex;gap:4px;overflow-x:auto;padding:10px 12px;background:var(--card);
+  border-bottom:1px solid var(--line);position:sticky;top:64px;z-index:19;scrollbar-width:none}
+.tabs::-webkit-scrollbar{display:none}
+.tab{flex:0 0 auto;border:1px solid var(--line);background:var(--paper);color:var(--ink2);
+  padding:8px 13px;border-radius:999px;font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap}
+.tab.active{background:var(--ink);color:#fff;border-color:var(--ink)}
+
+/* sections */
+.wrap{padding:16px 14px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;
+  box-shadow:var(--shadow);margin-bottom:14px;overflow:hidden}
+.card-h{padding:13px 15px;border-bottom:1px solid var(--line);display:flex;
+  justify-content:space-between;align-items:center}
+.card-h h2{margin:0;font-size:15px;font-weight:700}
+.card-b{padding:13px 15px}
+
+/* summary numbers */
+.big{font-size:30px;font-weight:800;letter-spacing:-.5px;margin:2px 0}
+.big.pos{color:var(--pos)} .big.neg{color:var(--neg)}
+.sub{font-size:12.5px;color:var(--muted);line-height:1.45}
+.kpi{display:flex;justify-content:space-between;align-items:baseline;
+  padding:9px 0;border-bottom:1px dashed var(--line)}
+.kpi:last-child{border-bottom:0}
+.kpi .lab{font-size:13px;color:var(--ink2);flex:1;padding-right:10px}
+.kpi .val{font-size:15px;font-weight:700}
+.val.pos{color:var(--pos)} .val.neg{color:var(--neg)}
+.pill{display:inline-block;font-size:11px;font-weight:700;padding:3px 9px;border-radius:999px}
+.pill.pos{background:var(--pos-bg);color:var(--pos)}
+.pill.neg{background:var(--neg-bg);color:var(--neg)}
+
+/* rows / list of entries */
+.entry{border:1px solid var(--line);border-radius:11px;padding:11px 12px;margin-bottom:9px;background:#fff}
+.entry .er1{display:flex;justify-content:space-between;align-items:flex-start;gap:8px}
+.entry .desc{font-weight:600;font-size:14px;line-height:1.3}
+.entry .date{font-size:11.5px;color:var(--muted);margin-top:1px}
+.entry .meta{display:flex;flex-wrap:wrap;gap:7px;margin-top:8px;font-size:12px;color:var(--ink2)}
+.entry .meta b{color:var(--ink)}
+.entry .amt{font-size:15px;font-weight:800;white-space:nowrap}
+.del{border:0;background:transparent;color:var(--neg);font-size:12px;cursor:pointer;
+  padding:4px 0 0;font-weight:600}
+.empty{text-align:center;color:var(--muted);font-size:13px;padding:18px 8px}
+
+/* form */
+.fld{margin-bottom:11px}
+.fld label{display:block;font-size:12px;font-weight:600;color:var(--ink2);margin-bottom:5px}
+.fld input,.fld select{width:100%;border:1.5px solid var(--line);border-radius:10px;
+  padding:11px 12px;font-size:15px;background:#fff;color:var(--ink);outline:none}
+.fld input:focus,.fld select:focus{border-color:var(--brass)}
+.frow{display:flex;gap:9px}.frow>*{flex:1}
+.add{width:100%;background:var(--ink);color:#fff;border:0;border-radius:11px;
+  padding:13px;font-size:15px;font-weight:700;cursor:pointer;margin-top:2px}
+.add:active{transform:translateY(1px)}
+.addbtn{background:var(--brass);color:#fff;border:0;border-radius:9px;padding:7px 13px;
+  font-size:13px;font-weight:700;cursor:pointer}
+.note{font-size:12px;color:var(--muted);background:var(--paper);border-radius:9px;
+  padding:9px 11px;margin-bottom:12px;line-height:1.5}
+
+/* settings */
+.set-row{display:flex;justify-content:space-between;align-items:center;gap:10px;
+  padding:11px 0;border-bottom:1px dashed var(--line)}
+.set-row:last-child{border-bottom:0}
+.set-row label{font-size:13.5px;color:var(--ink2);flex:1}
+.set-row input{width:120px;border:1.5px solid var(--line);border-radius:9px;
+  padding:9px 11px;font-size:15px;text-align:right}
+`;
+
+/* --------------------------- Small components --------------------------- */
+function Field({ label, ...p }) {
+  return (
+    <div className="fld">
+      <label>{label}</label>
+      <input {...p} />
+    </div>
+  );
+}
+function Select({ label, options, ...p }) {
+  return (
+    <div className="fld">
+      <label>{label}</label>
+      <select {...p}>
+        {options.map((o) => (
+          <option key={o.value ?? o} value={o.value ?? o}>
+            {o.label ?? o}
+          </option>
+        ))}
+      </select>
+    </div>
+  );
+}
+function KPI({ lab, children, tone }) {
+  return (
+    <div className="kpi">
+      <span className="lab">{lab}</span>
+      <span className={"val mono" + (tone ? " " + tone : "")}>{children}</span>
+    </div>
+  );
+}
+function toneOf(v) {
+  return v > 0.0001 ? "pos" : v < -0.0001 ? "neg" : "";
+}
+
+/* ============================ Calculations =============================
+   Mirrors the spreadsheet exactly. Sign convention for "net":
+   positive  => Ahmed owes Mohamed (Mohamed is ahead)
+   negative  => Mohamed owes Ahmed
+======================================================================= */
+function useCalc(data) {
+  return useMemo(() => {
+    const s2 = data.settings.share2;
+    const rate = data.settings.rate;
+
+    // Company 1
+    let c1Income = 0, c1Expense = 0, c1Due = 0, c1Paid = 0;
+    data.company1.forEach((r) => {
+      c1Income += n(r.income);
+      c1Expense += n(r.expense);
+      if (r.distributed === "Yes") {
+        c1Due += (n(r.income) - n(r.expense)) * s2;
+        c1Paid += n(r.paidToAhmed);
+      }
+    });
+    const c1Cash = c1Income - c1Expense - data.company1.reduce((a, r) => a + n(r.paidToAhmed), 0);
+    const c1Net = c1Paid - c1Due; // paid - due
+
+    // Company 2
+    let c2Cap = 0, c2Due = 0, c2Paid = 0;
+    data.company2.forEach((r) => {
+      if (r.status !== "Sold") c2Cap += n(r.current);
+      if (r.status === "Sold") {
+        c2Due += n(r.sale) * s2;
+        c2Paid += n(r.paidToAhmed);
+      }
+    });
+    const c2Net = c2Paid - c2Due;
+    const c2DebtRemain = n(data.company2debt.total) - n(data.company2debt.paidBack);
+
+    // Company 3
+    let c3Pocket = 0, c3Returned = 0, c3Due = 0, c3Paid = 0;
+    data.company3.forEach((r) => {
+      c3Pocket += n(r.fromPocket);
+      c3Returned += n(r.returnedToMohamed);
+      c3Due += (n(r.profit) - n(r.fromPocket)) * s2;
+      c3Paid += n(r.paidToAhmed);
+    });
+    const c3MohamedOwedBack = c3Pocket - c3Returned;
+    const c3Net = c3Paid - c3Due;
+
+    // Real estate
+    let reOwed = 0, rePaid = 0, reEgp = 0, reFullValue = 0;
+    data.realestate.forEach((r) => {
+      const inst = n(r.installment);
+      const full = inst / 0.8;
+      const share = full * s2;
+      reOwed += inst + share; // Mohamed owes Ahmed = installment + share
+      rePaid += n(r.paidToAhmed);
+      reEgp += inst * rate;
+      reFullValue += full;
+    });
+    const reNet = rePaid - reOwed;
+
+    // Private
+    let prMohamed = 0, prAhmed = 0;
+    data.private.forEach((r) => {
+      if (r.settled === "No") {
+        if (r.whoPaid === data.settings.p1) prMohamed += n(r.amount);
+        if (r.whoPaid === data.settings.p2) prAhmed += n(r.amount);
+      }
+    });
+    const prNet = prMohamed - prAhmed; // positive => Ahmed owes Mohamed
+
+    const subtotal = c1Net + c2Net + c3Net + reNet + prNet;
+    const debtLine = -c2DebtRemain; // company owes Ahmed
+    const grand = subtotal + debtLine;
+    const stillOwedAhmed = c1Net + c2Net + c3Net + reNet;
+
+    return {
+      c1: { cash: c1Cash, due: c1Due, paid: c1Paid, net: c1Net },
+      c2: { cap: c2Cap, due: c2Due, paid: c2Paid, net: c2Net, debtRemain: c2DebtRemain },
+      c3: { owedBack: c3MohamedOwedBack, due: c3Due, paid: c3Paid, net: c3Net },
+      re: { owed: reOwed, paid: rePaid, net: reNet, egp: reEgp, fullValue: reFullValue },
+      pr: { mohamed: prMohamed, ahmed: prAhmed, net: prNet },
+      subtotal, debtLine, grand, stillOwedAhmed,
+    };
+  }, [data]);
+}
+
+/* =============================== Screens =============================== */
+
+function Summary({ data, calc }) {
+  const { p1, p2 } = data.settings;
+  const dir = (v) =>
+    v > 0.0001 ? `${p2} owes ${p1}` : v < -0.0001 ? `${p1} owes ${p2}` : "Settled";
+  return (
+    <div className="wrap">
+      <div className="card">
+        <div className="card-h"><h2>Overall position</h2></div>
+        <div className="card-b">
+          <div className="sub">Net of everything — personal balances and the company debt.</div>
+          <div className={"big mono " + (calc.grand >= 0 ? "pos" : "neg")}>{eur(calc.grand)}</div>
+          <span className={"pill " + (calc.grand >= 0 ? "pos" : "neg")}>{dir(calc.grand)}</span>
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="card-h"><h2>{p1} ↔ {p2} (personal)</h2></div>
+        <div className="card-b">
+          <KPI lab="Company 1" tone={toneOf(calc.c1.net)}>{eur(calc.c1.net)}</KPI>
+          <KPI lab="Company 2 — car sales" tone={toneOf(calc.c2.net)}>{eur(calc.c2.net)}</KPI>
+          <KPI lab="Company 3" tone={toneOf(calc.c3.net)}>{eur(calc.c3.net)}</KPI>
+          <KPI lab="Real Estate" tone={toneOf(calc.re.net)}>{eur(calc.re.net)}</KPI>
+          <KPI lab="Private accounts" tone={toneOf(calc.pr.net)}>{eur(calc.pr.net)}</KPI>
+          <KPI lab="Subtotal (personal)" tone={toneOf(calc.subtotal)}>
+            <b>{eur(calc.subtotal)}</b>
+          </KPI>
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="card-h"><h2>{p2}'s debt on the company</h2></div>
+        <div className="card-b">
+          <KPI lab="Remaining (paid from car sales)" tone={toneOf(calc.debtLine)}>
+            {eur(calc.debtLine)}
+          </KPI>
+          <div className="sub" style={{ marginTop: 8 }}>
+            Negative because the company still owes this to {p2}.
+          </div>
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="card-h"><h2>Has {p2} been fully paid?</h2></div>
+        <div className="card-b">
+          <div className={"big mono " + (Math.abs(calc.stillOwedAhmed) < 0.01 ? "pos" : "neg")}>
+            {eur(calc.stillOwedAhmed)}
+          </div>
+          <div className="sub">
+            {Math.abs(calc.stillOwedAhmed) < 0.01
+              ? `${p2} has received everything owed.`
+              : calc.stillOwedAhmed < 0
+              ? `${p1} still owes ${p2} this amount.`
+              : `${p2} has received more than owed.`}
+          </div>
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="card-h"><h2>Cash & capital</h2></div>
+        <div className="card-b">
+          <KPI lab="Cash in hand — Company 1">{eur(calc.c1.cash)}</KPI>
+          <KPI lab="Capital — Company 2 (unsold cars)">{eur(calc.c2.cap)}</KPI>
+          <KPI lab={`Owed back to ${p1} — Company 3`}>{eur(calc.c3.owedBack)}</KPI>
+          <KPI lab="Real estate — full value">{eur(calc.re.fullValue)}</KPI>
+          <KPI lab="Real estate — paid in EGP">{egp(calc.re.egp)}</KPI>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ---- Company 1 ---- */
+function Company1({ data, set, calc }) {
+  const blank = { date: "", desc: "", income: "", expense: "", distributed: "No", paidToAhmed: "", notes: "" };
+  const [f, setF] = useState(blank);
+  const add = () => {
+    if (!f.desc && !f.income && !f.expense) return;
+    set({ ...data, company1: [{ id: uid(), ...f }, ...data.company1] });
+    setF(blank);
+  };
+  const del = (id) => set({ ...data, company1: data.company1.filter((r) => r.id !== id) });
+  return (
+    <div className="wrap">
+      <SummaryStrip items={[
+        ["Cash in hand", eur(calc.c1.cash), ""],
+        ["Owed to Ahmed", eur(calc.c1.due), ""],
+        ["Paid to Ahmed", eur(calc.c1.paid), ""],
+        ["Ahmed net", eur(calc.c1.net), toneOf(calc.c1.net)],
+      ]} />
+      <div className="card">
+        <div className="card-h"><h2>Add entry</h2></div>
+        <div className="card-b">
+          <Field label="Date" type="date" value={f.date} onChange={(e) => setF({ ...f, date: e.target.value })} />
+          <Field label="Description" value={f.desc} onChange={(e) => setF({ ...f, desc: e.target.value })} placeholder="Client payment / rent…" />
+          <div className="frow">
+            <Field label="Income (€)" type="number" inputMode="decimal" value={f.income} onChange={(e) => setF({ ...f, income: e.target.value })} />
+            <Field label="Expense (€)" type="number" inputMode="decimal" value={f.expense} onChange={(e) => setF({ ...f, expense: e.target.value })} />
+          </div>
+          <Select label="Distribute profit to partners?" value={f.distributed}
+            onChange={(e) => setF({ ...f, distributed: e.target.value })}
+            options={["No", "Yes"]} />
+          {f.distributed === "Yes" && (
+            <Field label="Paid to Ahmed now (€)" type="number" inputMode="decimal" value={f.paidToAhmed} onChange={(e) => setF({ ...f, paidToAhmed: e.target.value })} />
+          )}
+          <button className="add" onClick={add}>Add entry</button>
+        </div>
+      </div>
+      <Entries
+        list={data.company1}
+        render={(r) => {
+          const net = r.distributed === "Yes" ? n(r.paidToAhmed) - (n(r.income) - n(r.expense)) * data.settings.share2 : null;
+          return {
+            desc: r.desc || "(no description)",
+            date: r.date,
+            amt: n(r.income) ? "+" + eur(n(r.income)) : n(r.expense) ? "-" + eur(n(r.expense)) : "",
+            amtTone: n(r.income) ? "pos" : n(r.expense) ? "neg" : "",
+            meta: [
+              r.distributed === "Yes" ? ["Distributed", "Yes"] : null,
+              net !== null ? ["Ahmed +/-", eur(net)] : null,
+            ],
+          };
+        }}
+        onDel={del}
+      />
+    </div>
+  );
+}
+
+/* ---- Company 2 ---- */
+function Company2({ data, set, calc }) {
+  const blank = { name: "", buy: "", current: "", status: "Holding", sale: "", installment: "", bankRemaining: "", paidToAhmed: "", notes: "" };
+  const [f, setF] = useState(blank);
+  const add = () => {
+    if (!f.name) return;
+    set({ ...data, company2: [{ id: uid(), ...f }, ...data.company2] });
+    setF(blank);
+  };
+  const del = (id) => set({ ...data, company2: data.company2.filter((r) => r.id !== id) });
+  const setDebt = (k, v) => set({ ...data, company2debt: { ...data.company2debt, [k]: v } });
+  return (
+    <div className="wrap">
+      <SummaryStrip items={[
+        ["Capital (unsold)", eur(calc.c2.cap), ""],
+        ["Owed to Ahmed", eur(calc.c2.due), ""],
+        ["Paid to Ahmed", eur(calc.c2.paid), ""],
+        ["Ahmed net", eur(calc.c2.net), toneOf(calc.c2.net)],
+      ]} />
+      <div className="card">
+        <div className="card-h"><h2>Add car</h2></div>
+        <div className="card-b">
+          <Field label="Car name / model" value={f.name} onChange={(e) => setF({ ...f, name: e.target.value })} />
+          <div className="frow">
+            <Field label="Buy value (€)" type="number" inputMode="decimal" value={f.buy} onChange={(e) => setF({ ...f, buy: e.target.value })} />
+            <Field label="Current value (€)" type="number" inputMode="decimal" value={f.current} onChange={(e) => setF({ ...f, current: e.target.value })} />
+          </div>
+          <Select label="Status" value={f.status} onChange={(e) => setF({ ...f, status: e.target.value })}
+            options={["Holding", "For sale", "Sold"]} />
+          {f.status === "Sold" && (
+            <div className="frow">
+              <Field label="Sale price (€)" type="number" inputMode="decimal" value={f.sale} onChange={(e) => setF({ ...f, sale: e.target.value })} />
+              <Field label="Paid to Ahmed (€)" type="number" inputMode="decimal" value={f.paidToAhmed} onChange={(e) => setF({ ...f, paidToAhmed: e.target.value })} />
+            </div>
+          )}
+          <div className="frow">
+            <Field label="Monthly installment (€)" type="number" inputMode="decimal" value={f.installment} onChange={(e) => setF({ ...f, installment: e.target.value })} />
+            <Field label="Bank remaining (€)" type="number" inputMode="decimal" value={f.bankRemaining} onChange={(e) => setF({ ...f, bankRemaining: e.target.value })} />
+          </div>
+          <button className="add" onClick={add}>Add car</button>
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="card-h"><h2>Ahmed's debt on the company</h2></div>
+        <div className="card-b">
+          <div className="frow">
+            <Field label="Total debt (€)" type="number" inputMode="decimal" value={data.company2debt.total}
+              onChange={(e) => setDebt("total", e.target.value)} />
+            <Field label="Paid back (€)" type="number" inputMode="decimal" value={data.company2debt.paidBack}
+              onChange={(e) => setDebt("paidBack", e.target.value)} />
+          </div>
+          <KPI lab="Remaining for Ahmed" tone={calc.c2.debtRemain > 0 ? "neg" : ""}>
+            {eur(calc.c2.debtRemain)}
+          </KPI>
+        </div>
+      </div>
+
+      <Entries
+        list={data.company2}
+        render={(r) => ({
+          desc: r.name,
+          date: r.status,
+          amt: r.status === "Sold" ? eur(n(r.sale)) : eur(n(r.current)),
+          amtTone: r.status === "Sold" ? "pos" : "",
+          meta: [
+            n(r.installment) ? ["Installment", eur(n(r.installment))] : null,
+            n(r.bankRemaining) ? ["Bank left", eur(n(r.bankRemaining))] : null,
+            r.status === "Sold" ? ["Ahmed share", eur(n(r.sale) * data.settings.share2)] : null,
+          ],
+        })}
+        onDel={del}
+      />
+    </div>
+  );
+}
+
+/* ---- Company 3 ---- */
+function Company3({ data, set, calc }) {
+  const blank = { date: "", desc: "", profit: "", fromPocket: "", paidToAhmed: "", returnedToMohamed: "", notes: "" };
+  const [f, setF] = useState(blank);
+  const add = () => {
+    if (!f.desc && !f.profit) return;
+    set({ ...data, company3: [{ id: uid(), ...f }, ...data.company3] });
+    setF(blank);
+  };
+  const del = (id) => set({ ...data, company3: data.company3.filter((r) => r.id !== id) });
+  return (
+    <div className="wrap">
+      <SummaryStrip items={[
+        ["Owed back to Mohamed", eur(calc.c3.owedBack), ""],
+        ["Owed to Ahmed", eur(calc.c3.due), ""],
+        ["Paid to Ahmed", eur(calc.c3.paid), ""],
+        ["Ahmed net", eur(calc.c3.net), toneOf(calc.c3.net)],
+      ]} />
+      <div className="card">
+        <div className="card-h"><h2>Add work cycle</h2></div>
+        <div className="card-b">
+          <Field label="Date" type="date" value={f.date} onChange={(e) => setF({ ...f, date: e.target.value })} />
+          <Field label="Description" value={f.desc} onChange={(e) => setF({ ...f, desc: e.target.value })} />
+          <div className="frow">
+            <Field label="Profit (€)" type="number" inputMode="decimal" value={f.profit} onChange={(e) => setF({ ...f, profit: e.target.value })} />
+            <Field label="Mohamed paid from pocket (€)" type="number" inputMode="decimal" value={f.fromPocket} onChange={(e) => setF({ ...f, fromPocket: e.target.value })} />
+          </div>
+          <div className="frow">
+            <Field label="Paid to Ahmed (€)" type="number" inputMode="decimal" value={f.paidToAhmed} onChange={(e) => setF({ ...f, paidToAhmed: e.target.value })} />
+            <Field label="Returned to Mohamed (€)" type="number" inputMode="decimal" value={f.returnedToMohamed} onChange={(e) => setF({ ...f, returnedToMohamed: e.target.value })} />
+          </div>
+          <button className="add" onClick={add}>Add cycle</button>
+        </div>
+      </div>
+      <Entries
+        list={data.company3}
+        render={(r) => {
+          const net = n(r.paidToAhmed) - (n(r.profit) - n(r.fromPocket)) * data.settings.share2;
+          return {
+            desc: r.desc || "(cycle)",
+            date: r.date,
+            amt: eur(n(r.profit)),
+            amtTone: "pos",
+            meta: [
+              n(r.fromPocket) ? ["From pocket", eur(n(r.fromPocket))] : null,
+              ["Ahmed +/-", eur(net)],
+            ],
+          };
+        }}
+        onDel={del}
+      />
+    </div>
+  );
+}
+
+/* ---- Real Estate ---- */
+function RealEstate({ data, set, calc }) {
+  const blank = { date: "", desc: "", installment: "", paidToAhmed: "", notes: "" };
+  const [f, setF] = useState(blank);
+  const add = () => {
+    if (!f.installment) return;
+    set({ ...data, realestate: [{ id: uid(), ...f }, ...data.realestate] });
+    setF(blank);
+  };
+  const del = (id) => set({ ...data, realestate: data.realestate.filter((r) => r.id !== id) });
+  const s2 = data.settings.share2;
+  return (
+    <div className="wrap">
+      <div className="note">
+        Ahmed pays the installment. Mohamed owes Ahmed back: <b>installment + Ahmed's {Math.round(s2 * 100)}% share</b> of
+        the full value (installment = 80% of full value). Example: installment €3000 → full value €3750 → share €750 → Mohamed owes €3750.
+      </div>
+      <SummaryStrip items={[
+        ["Mohamed owes (total)", eur(calc.re.owed), ""],
+        ["Paid to Ahmed", eur(calc.re.paid), ""],
+        ["Ahmed net", eur(calc.re.net), toneOf(calc.re.net)],
+        ["Paid in EGP", egp(calc.re.egp), ""],
+      ]} />
+      <div className="card">
+        <div className="card-h"><h2>Add installment</h2></div>
+        <div className="card-b">
+          <Field label="Date" type="date" value={f.date} onChange={(e) => setF({ ...f, date: e.target.value })} />
+          <Field label="Description" value={f.desc} onChange={(e) => setF({ ...f, desc: e.target.value })} placeholder="January installment…" />
+          <div className="frow">
+            <Field label="Installment (Ahmed paid) (€)" type="number" inputMode="decimal" value={f.installment} onChange={(e) => setF({ ...f, installment: e.target.value })} />
+            <Field label="Paid to Ahmed (€)" type="number" inputMode="decimal" value={f.paidToAhmed} onChange={(e) => setF({ ...f, paidToAhmed: e.target.value })} />
+          </div>
+          {n(f.installment) > 0 && (
+            <div className="sub">
+              Full value {eur(n(f.installment) / 0.8)} · Ahmed's share {eur((n(f.installment) / 0.8) * s2)} · Mohamed owes{" "}
+              <b>{eur(n(f.installment) + (n(f.installment) / 0.8) * s2)}</b>
+            </div>
+          )}
+          <button className="add" onClick={add} style={{ marginTop: 10 }}>Add installment</button>
+        </div>
+      </div>
+      <Entries
+        list={data.realestate}
+        render={(r) => {
+          const full = n(r.installment) / 0.8;
+          const owed = n(r.installment) + full * s2;
+          const net = n(r.paidToAhmed) - owed;
+          return {
+            desc: r.desc || "Installment",
+            date: r.date,
+            amt: eur(n(r.installment)),
+            amtTone: "",
+            meta: [
+              ["Mohamed owes", eur(owed)],
+              ["Ahmed +/-", eur(net)],
+            ],
+          };
+        }}
+        onDel={del}
+      />
+    </div>
+  );
+}
+
+/* ---- Private ---- */
+function Private({ data, set, calc }) {
+  const { p1, p2 } = data.settings;
+  const blank = { date: "", desc: "", whoPaid: p1, forWhom: p2, amount: "", settled: "No", notes: "" };
+  const [f, setF] = useState(blank);
+  const add = () => {
+    if (!f.amount) return;
+    set({ ...data, private: [{ id: uid(), ...f }, ...data.private] });
+    setF(blank);
+  };
+  const del = (id) => set({ ...data, private: data.private.filter((r) => r.id !== id) });
+  return (
+    <div className="wrap">
+      <SummaryStrip items={[
+        [`${p1} paid for ${p2}`, eur(calc.pr.mohamed), ""],
+        [`${p2} paid for ${p1}`, eur(calc.pr.ahmed), ""],
+        ["Net for Mohamed", eur(calc.pr.net), toneOf(calc.pr.net)],
+      ]} />
+      <div className="card">
+        <div className="card-h"><h2>Add private payment</h2></div>
+        <div className="card-b">
+          <Field label="Date" type="date" value={f.date} onChange={(e) => setF({ ...f, date: e.target.value })} />
+          <Field label="Description" value={f.desc} onChange={(e) => setF({ ...f, desc: e.target.value })} />
+          <Field label="Amount (€)" type="number" inputMode="decimal" value={f.amount} onChange={(e) => setF({ ...f, amount: e.target.value })} />
+          <div className="frow">
+            <Select label="Who paid" value={f.whoPaid} onChange={(e) => setF({ ...f, whoPaid: e.target.value })} options={[p1, p2]} />
+            <Select label="For whom" value={f.forWhom} onChange={(e) => setF({ ...f, forWhom: e.target.value })} options={[p2, p1]} />
+          </div>
+          <Select label="Settled?" value={f.settled} onChange={(e) => setF({ ...f, settled: e.target.value })} options={["No", "Yes"]} />
+          <button className="add" onClick={add}>Add payment</button>
+        </div>
+      </div>
+      <Entries
+        list={data.private}
+        render={(r) => ({
+          desc: r.desc || "(payment)",
+          date: r.date,
+          amt: eur(n(r.amount)),
+          amtTone: "",
+          meta: [
+            ["Paid by", r.whoPaid],
+            ["For", r.forWhom],
+            ["Settled", r.settled],
+          ],
+        })}
+        onDel={del}
+      />
+    </div>
+  );
+}
+
+/* ---- Settings ---- */
+function Settings({ data, set, onExport, onImport }) {
+  const s = data.settings;
+  const upd = (k, v) => set({ ...data, settings: { ...s, [k]: v } });
+  return (
+    <div className="wrap">
+      <div className="card">
+        <div className="card-h"><h2>Settings</h2></div>
+        <div className="card-b">
+          <div className="set-row"><label>Partner 1 name (80%)</label>
+            <input value={s.p1} onChange={(e) => upd("p1", e.target.value)} /></div>
+          <div className="set-row"><label>Partner 2 name (20%)</label>
+            <input value={s.p2} onChange={(e) => upd("p2", e.target.value)} /></div>
+          <div className="set-row"><label>Partner 2 share</label>
+            <input type="number" step="0.01" value={s.share2} onChange={(e) => upd("share2", n(e.target.value))} /></div>
+          <div className="set-row"><label>EUR → EGP rate</label>
+            <input type="number" value={s.rate} onChange={(e) => upd("rate", n(e.target.value))} /></div>
+        </div>
+      </div>
+      <div className="card">
+        <div className="card-h"><h2>Backup & restore</h2></div>
+        <div className="card-b">
+          <div className="sub" style={{marginBottom:10}}>
+            Data is saved in this browser. Export a backup file to keep it safe or move it to another device.
+          </div>
+          <button className="add" onClick={onExport}>Export backup file</button>
+          <label className="add" style={{display:"block",textAlign:"center",marginTop:9,background:"var(--brass)"}}>
+            Import backup file
+            <input type="file" accept="application/json" onChange={onImport} style={{display:"none"}} />
+          </label>
+        </div>
+      </div>
+      <div className="note">
+        To sync the same data between two phones, follow the Supabase guide that came with this app.
+      </div>
+    </div>
+  );
+}
+
+/* --------------------- Shared list + summary strip ---------------------- */
+function SummaryStrip({ items }) {
+  return (
+    <div className="card">
+      <div className="card-b" style={{ paddingTop: 6, paddingBottom: 6 }}>
+        {items.map(([lab, val, tone], i) => (
+          <KPI key={i} lab={lab} tone={tone}>{val}</KPI>
+        ))}
+      </div>
+    </div>
+  );
+}
+function Entries({ list, render, onDel }) {
+  if (!list.length) return <div className="empty">No entries yet. Add your first one above.</div>;
+  return (
+    <div>
+      {list.map((r) => {
+        const v = render(r);
+        return (
+          <div className="entry" key={r.id}>
+            <div className="er1">
+              <div>
+                <div className="desc">{v.desc}</div>
+                {v.date && <div className="date">{v.date}</div>}
+              </div>
+              {v.amt && <div className={"amt mono " + (v.amtTone || "")}>{v.amt}</div>}
+            </div>
+            {v.meta && v.meta.filter(Boolean).length > 0 && (
+              <div className="meta">
+                {v.meta.filter(Boolean).map(([k, val], i) => (
+                  <span key={i}>{k}: <b>{val}</b></span>
+                ))}
+              </div>
+            )}
+            <button className="del" onClick={() => onDel(r.id)}>Delete</button>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+/* ================================ Root ================================= */
+const TABS = [
+  ["summary", "Summary"],
+  ["c1", "Company 1"],
+  ["c2", "Company 2"],
+  ["c3", "Company 3"],
+  ["re", "Real Estate"],
+  ["private", "Private"],
+  ["settings", "Settings"],
+];
+
+function App() {
+  const [data, setData] = useState(null);
+  const [tab, setTab] = useState("summary");
+  const [saved, setSaved] = useState(false);
+
+  useEffect(() => { loadAll().then(setData); }, []);
+  const set = (d) => { setData(d); saveAll(d).then(() => { setSaved(true); setTimeout(() => setSaved(false), 800); }); };
+
+  const exportData = () => {
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = "partnership-backup.json"; a.click();
+    URL.revokeObjectURL(url);
+  };
+  const importData = (e) => {
+    const file = e.target.files[0]; if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try { set({ ...DEFAULT_DATA, ...JSON.parse(reader.result) }); }
+      catch { alert("Could not read that file."); }
+    };
+    reader.readAsText(file);
+    e.target.value = "";
+  };
+
+  const calc = useCalc(data || DEFAULT_DATA);
+  if (!data) return <div style={{ padding: 40, textAlign: "center", color: "#7b8494" }}>Loading…</div>;
+
+  return (
+    <>
+      <style>{css}</style>
+      <div className="app">
+        <div className="top">
+          <h1>Partnership Ledger</h1>
+          <p>{data.settings.p1} 80% · {data.settings.p2} 20%</p>
+          <div className="sync"><span className={"dot" + (saved ? " on" : "")} />{saved ? "Saved" : "Saved locally"}</div>
+        </div>
+        <div className="tabs">
+          {TABS.map(([id, label]) => (
+            <button key={id} className={"tab" + (tab === id ? " active" : "")} onClick={() => setTab(id)}>
+              {label}
+            </button>
+          ))}
+        </div>
+        {tab === "summary" && <Summary data={data} calc={calc} />}
+        {tab === "c1" && <Company1 data={data} set={set} calc={calc} />}
+        {tab === "c2" && <Company2 data={data} set={set} calc={calc} />}
+        {tab === "c3" && <Company3 data={data} set={set} calc={calc} />}
+        {tab === "re" && <RealEstate data={data} set={set} calc={calc} />}
+        {tab === "private" && <Private data={data} set={set} calc={calc} />}
+        {tab === "settings" && <Settings data={data} set={set} onExport={exportData} onImport={importData} />}
+      </div>
+    </>
+  );
+}
+
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<App />);
+</script>
+</body>
+</html>
