@@ -19,6 +19,9 @@ const { useState, useEffect, useMemo } = React;
 
 
 
+
+
+
 /* =========================================================================
    Partnership Tracker v2 — Mohamed (80%) & Ahmed (20%)
    Each company: Einnahmen (income), Ausgaben (expenses), Kasse (cash),
@@ -198,6 +201,19 @@ function calcCompany(co, share2, p1, p2) {
   return { income, expense, net, kasse, drawP1, drawP2, dueP1, dueP2, balP1, balP2 };
 }
 
+/* ---- Real Estate: simple ledger, all amounts in EUR.
+       Ahmed pays installments, Mohamed pays him back the same amount.
+       EGP amount + rate are optional notes for documentation only —
+       they do NOT affect any calculation.  ---- */
+function calcRE(co) {
+  let paidByP2 = 0;
+  co.moves.forEach((m) => { paidByP2 += n(m.amount); });
+  let sentToP2 = 0;
+  co.draws.forEach((d) => { sentToP2 += n(d.amount); });
+  const balP2 = sentToP2 - paidByP2;   // − لسه ليه / + اتسلم زيادة
+  return { paidByP2, sentToP2, balP2 };
+}
+
 /* ------------------------------ Components ------------------------------ */
 function CompanyView({ ckey, data, set }) {
   const co = data.companies[ckey];
@@ -317,7 +333,7 @@ function CompanyView({ ckey, data, set }) {
           {co.draws.map((d) => (
             <div className="entry" key={d.id} style={{ background: "#faf7f0" }}>
               <div>
-                <div className="desc">Taken by {d.who}</div>
+                <div className="desc">Taken by {d.who}{d.note ? " · " + d.note : ""}</div>
                 <div className="date">{d.date || "—"}</div>
               </div>
               <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
@@ -332,14 +348,157 @@ function CompanyView({ ckey, data, set }) {
   );
 }
 
+function RealEstateView({ data, set }) {
+  const co = data.companies.re;
+  const { p1, p2 } = data.settings;
+  const c = calcRE(co);
+
+  const [mv, setMv] = useState({ date: "", desc: "", amount: "", egp: "", rate: "" });
+  const [dw, setDw] = useState({ date: "", amount: "", egp: "", rate: "" });
+
+  const addPaid = () => {
+    if (!mv.amount) return;
+    const co2 = { ...co, moves: [{ id: uid(), type: "in", ...mv }, ...co.moves] };
+    set({ ...data, companies: { ...data.companies, re: co2 } });
+    setMv({ date: "", desc: "", amount: "", egp: "", rate: mv.rate });
+  };
+  const addSent = () => {
+    if (!dw.amount) return;
+    const co2 = { ...co, draws: [{ id: uid(), who: p2, ...dw }, ...co.draws] };
+    set({ ...data, companies: { ...data.companies, re: co2 } });
+    setDw({ date: "", amount: "", egp: "", rate: dw.rate });
+  };
+  const delMove = (id) =>
+    set({ ...data, companies: { ...data.companies, re: { ...co, moves: co.moves.filter((m) => m.id !== id) } } });
+  const delDraw = (id) =>
+    set({ ...data, companies: { ...data.companies, re: { ...co, draws: co.draws.filter((d) => d.id !== id) } } });
+
+  const remaining = Math.max(0, -c.balP2);
+  const balCls = Math.abs(c.balP2) < 0.005 ? "z" : c.balP2 > 0 ? "p" : "n";
+  const balState = Math.abs(c.balP2) < 0.005 ? "Settled" : c.balP2 > 0 ? "Got extra (+)" : "Still owed (\u2212)";
+
+  return (
+    <div className="wrap">
+      <div className="card">
+        <div className="card-b">
+          <div className="kasse">
+            <div className="lbl">{p1} still owes {p2}</div>
+            <div className={"big mono " + (remaining > 0 ? "neg" : "")}>{eur(remaining)}</div>
+          </div>
+          <div className="split">
+            <div className="col"><div className="t">{p2} paid</div><div className="v mono">{eur(c.paidByP2)}</div></div>
+            <div className="col"><div className="t">{p1} sent back</div><div className="v mono">{eur(c.sentToP2)}</div></div>
+            <div className="col"><div className="t">Balance</div><div className={"v mono " + (c.balP2 > 0 ? "pos" : c.balP2 < 0 ? "neg" : "")}>{eur(c.balP2)}</div></div>
+          </div>
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="card-h"><h2>Balance</h2></div>
+        <div className="card-b">
+          <div className={"bal " + balCls}>
+            <div>
+              <div className="who">{p2}</div>
+              <div className="st">Paid {eur(c.paidByP2)} \u00b7 Received {eur(c.sentToP2)} \u00b7 {balState}</div>
+            </div>
+            <div className={"amt mono " + (c.balP2 > 0 ? "pos" : c.balP2 < 0 ? "neg" : "")}>{eur(c.balP2)}</div>
+          </div>
+          <div className="note">
+            {p2} pays the property installments from his own pocket. {p1} pays him back the same amount in \u20ac.
+            The EGP amount and rate are optional \u2014 recorded for your reference only, they don't affect the balance.
+            <br />\u2212 means {p1} still owes him \u00b7 + means he received more \u00b7 0 means settled.
+          </div>
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="card-h"><h2>{p2} paid an installment</h2></div>
+        <div className="card-b">
+          <div className="frow">
+            <div className="fld"><label>Date</label><input type="date" value={mv.date} onChange={(e) => setMv({ ...mv, date: e.target.value })} /></div>
+            <div className="fld"><label>Amount (\u20ac)</label><input type="number" inputMode="decimal" value={mv.amount} onChange={(e) => setMv({ ...mv, amount: e.target.value })} /></div>
+          </div>
+          <div className="frow">
+            <div className="fld"><label>EGP paid (optional)</label><input type="number" inputMode="decimal" value={mv.egp} onChange={(e) => setMv({ ...mv, egp: e.target.value })} placeholder="for the record" /></div>
+            <div className="fld"><label>Rate that day (optional)</label><input type="number" inputMode="decimal" value={mv.rate} onChange={(e) => setMv({ ...mv, rate: e.target.value })} placeholder="1 \u20ac = ?" /></div>
+          </div>
+          <div className="fld"><label>Description</label><input value={mv.desc} onChange={(e) => setMv({ ...mv, desc: e.target.value })} placeholder="optional" /></div>
+          <button className="add" onClick={addPaid}>Add installment</button>
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="card-h"><h2>{p1} sent money to {p2}</h2></div>
+        <div className="card-b">
+          <div className="frow">
+            <div className="fld"><label>Date</label><input type="date" value={dw.date} onChange={(e) => setDw({ ...dw, date: e.target.value })} /></div>
+            <div className="fld"><label>Amount (\u20ac)</label><input type="number" inputMode="decimal" value={dw.amount} onChange={(e) => setDw({ ...dw, amount: e.target.value })} /></div>
+          </div>
+          <div className="frow">
+            <div className="fld"><label>EGP received (optional)</label><input type="number" inputMode="decimal" value={dw.egp} onChange={(e) => setDw({ ...dw, egp: e.target.value })} placeholder="for the record" /></div>
+            <div className="fld"><label>Rate that day (optional)</label><input type="number" inputMode="decimal" value={dw.rate} onChange={(e) => setDw({ ...dw, rate: e.target.value })} placeholder="1 \u20ac = ?" /></div>
+          </div>
+          <button className="add" onClick={addSent}>Record payment</button>
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="card-h"><h2>History</h2></div>
+        <div className="card-b">
+          {co.moves.length === 0 && co.draws.length === 0 && <div className="empty">No entries yet.</div>}
+          {co.moves.map((m) => (
+            <div className="entry" key={m.id}>
+              <div>
+                <div className="desc">{p2} paid{m.desc ? " \u00b7 " + m.desc : ""}</div>
+                <div className="date">
+                  {m.date || "\u2014"}
+                  {n(m.egp) > 0 ? " \u00b7 " + n(m.egp).toLocaleString() + " EGP" : ""}
+                  {n(m.rate) > 0 ? " @ " + n(m.rate) : ""}
+                </div>
+              </div>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <span className="amt mono neg">{eur(n(m.amount))}</span>
+                <button className="del" onClick={() => delMove(m.id)}>\u00d7</button>
+              </div>
+            </div>
+          ))}
+          {co.draws.map((d) => (
+            <div className="entry" key={d.id} style={{ background: "#faf7f0" }}>
+              <div>
+                <div className="desc">{p1} sent to {p2}</div>
+                <div className="date">
+                  {d.date || "\u2014"}
+                  {n(d.egp) > 0 ? " \u00b7 " + n(d.egp).toLocaleString() + " EGP" : ""}
+                  {n(d.rate) > 0 ? " @ " + n(d.rate) : ""}
+                </div>
+              </div>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <span className="amt mono pos">{eur(n(d.amount))}</span>
+                <button className="del" onClick={() => delDraw(d.id)}>\u00d7</button>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
 function Overview({ data }) {
   const { p1, p2, share2 } = data.settings;
   let totKasse = 0, totBalP1 = 0, totBalP2 = 0;
   const rows = Object.keys(data.companies).map((k) => {
     const co = data.companies[k];
+    if (k === "re") {
+      // Real estate: separate ledger, no cash box. Only Ahmed has a balance.
+      const r = calcRE(co);
+      totBalP2 += r.balP2;
+      return { name: co.name, isRE: true, balP2: r.balP2, paid: r.paidByP2, sent: r.sentToP2 };
+    }
     const c = calcCompany(co, share2, p1, p2);
     totKasse += c.kasse; totBalP1 += c.balP1; totBalP2 += c.balP2;
-    return { name: co.name, ...c };
+    return { name: co.name, isRE: false, ...c };
   });
   const balCls = (v) => (v > 0 ? "pos" : v < 0 ? "neg" : "");
   return (
@@ -371,7 +530,13 @@ function Overview({ data }) {
           {rows.map((r, i) => (
             <div className="kpi" key={i}>
               <span className="lab">{r.name}</span>
-              <span className="val mono">Kasse {eur(r.kasse)}</span>
+              {r.isRE ? (
+                <span className={"val mono " + balCls(r.balP2)}>
+                  {Math.abs(r.balP2) < 0.005 ? "Settled" : eur(r.balP2)}
+                </span>
+              ) : (
+                <span className="val mono">Kasse {eur(r.kasse)}</span>
+              )}
             </div>
           ))}
         </div>
@@ -454,11 +619,16 @@ function App() {
         </div>
         {tab === "overview" && <Overview data={data} />}
         {tab === "settings" && <Settings data={data} set={set} />}
-        {data.companies[tab] && <CompanyView ckey={tab} data={data} set={set} />}
+        {tab === "re" && <RealEstateView data={data} set={set} />}
+        {data.companies[tab] && tab !== "re" && <CompanyView ckey={tab} data={data} set={set} />}
       </div>
     </>
   );
 }
+
+
+
+
 
 
 const root = ReactDOM.createRoot(document.getElementById("root"));
