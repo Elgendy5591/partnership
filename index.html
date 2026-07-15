@@ -43,6 +43,13 @@ const DEFAULT_DATA = {
     c3: { name: "Company 3", moves: [], draws: [] },
     re: { name: "Real Estate", moves: [], draws: [] },
   },
+  // company owes a partner: {id,date,co,who,amount,desc}
+  debts: [],
+  // company repaid a partner (deducted from that company's Kasse): {id,date,co,who,amount}
+  repays: [],
+  // personal money between the two, nothing to do with any Kasse:
+  // {id,date,from,to,amount,desc,settled:'Yes'|'No'}
+  personal: [],
 };
 
 async function loadAll() {
@@ -78,6 +85,9 @@ function mergeDefaults(d) {
       }
     }
   }
+  out.debts = d.debts || [];
+  out.repays = d.repays || [];
+  out.personal = d.personal || [];
   return out;
 }
 
@@ -180,7 +190,7 @@ body{background:var(--paper);color:var(--ink);
 `;
 
 /* --------------------------- Calc per company --------------------------- */
-function calcCompany(co, share2, p1, p2) {
+function calcCompany(co, share2, p1, p2, repays, ckey) {
   let income = 0, expense = 0;
   co.moves.forEach((m) => {
     if (m.type === "in") income += n(m.amount);
@@ -193,12 +203,15 @@ function calcCompany(co, share2, p1, p2) {
     else if (d.who === p2) drawP2 += n(d.amount);
   });
   const totalDraw = drawP1 + drawP2;
-  const kasse = net - totalDraw;                   // الكاسة الحالية
+  // debt repayments made by THIS company also leave its Kasse
+  let repaid = 0;
+  (repays || []).forEach((r) => { if (r.co === ckey) repaid += n(r.amount); });
+  const kasse = net - totalDraw - repaid;          // الكاسة الحالية
   const dueP1 = net * (1 - share2);                // نصيب محمد المستحق
   const dueP2 = net * share2;                       // نصيب أحمد المستحق
   const balP1 = drawP1 - dueP1;                     // + واخد زيادة / - لسه ليه
   const balP2 = drawP2 - dueP2;
-  return { income, expense, net, kasse, drawP1, drawP2, dueP1, dueP2, balP1, balP2 };
+  return { income, expense, net, kasse, repaid, drawP1, drawP2, dueP1, dueP2, balP1, balP2 };
 }
 
 /* ---- Real Estate: simple ledger, all amounts in EUR.
@@ -218,7 +231,7 @@ function calcRE(co) {
 function CompanyView({ ckey, data, set }) {
   const co = data.companies[ckey];
   const { p1, p2, share2 } = data.settings;
-  const c = calcCompany(co, share2, p1, p2);
+  const c = calcCompany(co, share2, p1, p2, data.repays, ckey);
 
   const [mode, setMode] = useState("in"); // in | out
   const [mv, setMv] = useState({ date: "", desc: "", amount: "" });
@@ -354,7 +367,7 @@ function RealEstateView({ data, set }) {
   const c = calcRE(co);
 
   const [mv, setMv] = useState({ date: "", desc: "", amount: "", egp: "", rate: "" });
-  const [dw, setDw] = useState({ date: "", amount: "", egp: "", rate: "" });
+  const [dw, setDw] = useState({ date: "", amount: "", egp: "", rate: "", desc: "" });
 
   const addPaid = () => {
     if (!mv.amount) return;
@@ -366,7 +379,7 @@ function RealEstateView({ data, set }) {
     if (!dw.amount) return;
     const co2 = { ...co, draws: [{ id: uid(), who: p2, ...dw }, ...co.draws] };
     set({ ...data, companies: { ...data.companies, re: co2 } });
-    setDw({ date: "", amount: "", egp: "", rate: dw.rate });
+    setDw({ date: "", amount: "", egp: "", rate: dw.rate, desc: "" });
   };
   const delMove = (id) =>
     set({ ...data, companies: { ...data.companies, re: { ...co, moves: co.moves.filter((m) => m.id !== id) } } });
@@ -438,6 +451,7 @@ function RealEstateView({ data, set }) {
             <div className="fld"><label>EGP received (optional)</label><input type="number" inputMode="decimal" value={dw.egp} onChange={(e) => setDw({ ...dw, egp: e.target.value })} placeholder="for the record" /></div>
             <div className="fld"><label>Rate that day (optional)</label><input type="number" inputMode="decimal" value={dw.rate} onChange={(e) => setDw({ ...dw, rate: e.target.value })} placeholder="1 \u20ac = ?" /></div>
           </div>
+          <div className="fld"><label>How did the money reach him? (description)</label><input value={dw.desc} onChange={(e) => setDw({ ...dw, desc: e.target.value })} placeholder="e.g. bank transfer, cash, via someone\u2026" /></div>
           <button className="add" onClick={addSent}>Record payment</button>
         </div>
       </div>
@@ -465,7 +479,7 @@ function RealEstateView({ data, set }) {
           {co.draws.map((d) => (
             <div className="entry" key={d.id} style={{ background: "#faf7f0" }}>
               <div>
-                <div className="desc">{p1} sent to {p2}</div>
+                <div className="desc">{p1} sent to {p2}{d.desc ? " \u00b7 " + d.desc : ""}</div>
                 <div className="date">
                   {d.date || "\u2014"}
                   {n(d.egp) > 0 ? " \u00b7 " + n(d.egp).toLocaleString() + " EGP" : ""}
@@ -485,6 +499,253 @@ function RealEstateView({ data, set }) {
 }
 
 
+/* ---- Debts: a company owes a partner. Repayments leave that company's Kasse. ---- */
+function calcDebts(data) {
+  const { p1, p2 } = data.settings;
+  const owed = {}; // per company+person
+  const byPerson = { [p1]: { owed: 0, repaid: 0 }, [p2]: { owed: 0, repaid: 0 } };
+  (data.debts || []).forEach((d) => {
+    if (byPerson[d.who]) byPerson[d.who].owed += n(d.amount);
+  });
+  (data.repays || []).forEach((r) => {
+    if (byPerson[r.who]) byPerson[r.who].repaid += n(r.amount);
+  });
+  return {
+    p1: { ...byPerson[p1], remaining: byPerson[p1].owed - byPerson[p1].repaid },
+    p2: { ...byPerson[p2], remaining: byPerson[p2].owed - byPerson[p2].repaid },
+  };
+}
+
+function DebtsView({ data, set }) {
+  const { p1, p2 } = data.settings;
+  const cashCos = Object.keys(data.companies).filter((k) => k !== "re");
+  const c = calcDebts(data);
+
+  const [db, setDb] = useState({ date: "", co: cashCos[0], who: p1, amount: "", desc: "" });
+  const [rp, setRp] = useState({ date: "", co: cashCos[0], who: p1, amount: "" });
+
+  const addDebt = () => {
+    if (!db.amount) return;
+    set({ ...data, debts: [{ id: uid(), ...db }, ...(data.debts || [])] });
+    setDb({ ...db, amount: "", desc: "", date: "" });
+  };
+  const addRepay = () => {
+    if (!rp.amount) return;
+    set({ ...data, repays: [{ id: uid(), ...rp }, ...(data.repays || [])] });
+    setRp({ ...rp, amount: "", date: "" });
+  };
+  const delDebt = (id) => set({ ...data, debts: (data.debts || []).filter((x) => x.id !== id) });
+  const delRepay = (id) => set({ ...data, repays: (data.repays || []).filter((x) => x.id !== id) });
+
+  const row = (name, o) => (
+    <div className={"bal " + (o.remaining > 0.005 ? "n" : "z")} style={{ marginTop: 8 }}>
+      <div>
+        <div className="who">{name}</div>
+        <div className="st">Owed {eur(o.owed)} \u00b7 Repaid {eur(o.repaid)} \u00b7 {o.remaining > 0.005 ? "Still owed" : "Settled"}</div>
+      </div>
+      <div className={"amt mono " + (o.remaining > 0.005 ? "neg" : "")}>{eur(o.remaining)}</div>
+    </div>
+  );
+
+  return (
+    <div className="wrap">
+      <div className="card">
+        <div className="card-h"><h2>What the companies still owe</h2></div>
+        <div className="card-b">
+          {row(p1, c.p1)}
+          {row(p2, c.p2)}
+          <div className="note">
+            Money a partner put into a company from his own pocket. The company pays it back over time.
+            Each repayment is deducted from that company's Kasse.
+          </div>
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="card-h"><h2>Add a debt (company owes someone)</h2></div>
+        <div className="card-b">
+          <div className="frow">
+            <div className="fld"><label>Date</label><input type="date" value={db.date} onChange={(e) => setDb({ ...db, date: e.target.value })} /></div>
+            <div className="fld"><label>Amount (\u20ac)</label><input type="number" inputMode="decimal" value={db.amount} onChange={(e) => setDb({ ...db, amount: e.target.value })} /></div>
+          </div>
+          <div className="frow">
+            <div className="fld"><label>Which company?</label>
+              <select value={db.co} onChange={(e) => setDb({ ...db, co: e.target.value })}>
+                {cashCos.map((k) => <option key={k} value={k}>{data.companies[k].name}</option>)}
+              </select>
+            </div>
+            <div className="fld"><label>Owes who?</label>
+              <select value={db.who} onChange={(e) => setDb({ ...db, who: e.target.value })}>
+                <option value={p1}>{p1}</option>
+                <option value={p2}>{p2}</option>
+              </select>
+            </div>
+          </div>
+          <div className="fld"><label>Description</label><input value={db.desc} onChange={(e) => setDb({ ...db, desc: e.target.value })} placeholder="optional" /></div>
+          <button className="add" onClick={addDebt}>Add debt</button>
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="card-h"><h2>Company repaid someone</h2></div>
+        <div className="card-b">
+          <div className="frow">
+            <div className="fld"><label>Date</label><input type="date" value={rp.date} onChange={(e) => setRp({ ...rp, date: e.target.value })} /></div>
+            <div className="fld"><label>Amount (\u20ac)</label><input type="number" inputMode="decimal" value={rp.amount} onChange={(e) => setRp({ ...rp, amount: e.target.value })} /></div>
+          </div>
+          <div className="frow">
+            <div className="fld"><label>From which company?</label>
+              <select value={rp.co} onChange={(e) => setRp({ ...rp, co: e.target.value })}>
+                {cashCos.map((k) => <option key={k} value={k}>{data.companies[k].name}</option>)}
+              </select>
+            </div>
+            <div className="fld"><label>Paid to?</label>
+              <select value={rp.who} onChange={(e) => setRp({ ...rp, who: e.target.value })}>
+                <option value={p1}>{p1}</option>
+                <option value={p2}>{p2}</option>
+              </select>
+            </div>
+          </div>
+          <div className="note" style={{ marginTop: 0, marginBottom: 10 }}>
+            This amount will be deducted from {data.companies[rp.co] ? data.companies[rp.co].name : "\u2014"}'s Kasse.
+          </div>
+          <button className="add" onClick={addRepay}>Record repayment</button>
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="card-h"><h2>History</h2></div>
+        <div className="card-b">
+          {(data.debts || []).length === 0 && (data.repays || []).length === 0 && <div className="empty">No entries yet.</div>}
+          {(data.debts || []).map((d) => (
+            <div className="entry" key={d.id}>
+              <div>
+                <div className="desc">{data.companies[d.co] ? data.companies[d.co].name : d.co} owes {d.who}{d.desc ? " \u00b7 " + d.desc : ""}</div>
+                <div className="date">{d.date || "\u2014"}</div>
+              </div>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <span className="amt mono neg">{eur(n(d.amount))}</span>
+                <button className="del" onClick={() => delDebt(d.id)}>\u00d7</button>
+              </div>
+            </div>
+          ))}
+          {(data.repays || []).map((r) => (
+            <div className="entry" key={r.id} style={{ background: "#faf7f0" }}>
+              <div>
+                <div className="desc">{data.companies[r.co] ? data.companies[r.co].name : r.co} repaid {r.who}</div>
+                <div className="date">{r.date || "\u2014"}</div>
+              </div>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <span className="amt mono pos">{eur(n(r.amount))}</span>
+                <button className="del" onClick={() => delRepay(r.id)}>\u00d7</button>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ---- Personal: money between the two, nothing to do with any Kasse. ---- */
+function calcPersonal(data) {
+  const { p1, p2 } = data.settings;
+  let p1PaidForP2 = 0, p2PaidForP1 = 0;
+  (data.personal || []).forEach((x) => {
+    if (x.settled === "Yes") return;
+    if (x.from === p1) p1PaidForP2 += n(x.amount);
+    else if (x.from === p2) p2PaidForP1 += n(x.amount);
+  });
+  // positive => p2 owes p1 ; negative => p1 owes p2
+  return { p1PaidForP2, p2PaidForP1, net: p1PaidForP2 - p2PaidForP1 };
+}
+
+function PersonalView({ data, set }) {
+  const { p1, p2 } = data.settings;
+  const c = calcPersonal(data);
+  const [f, setF] = useState({ date: "", from: p1, amount: "", desc: "", settled: "No" });
+
+  const add = () => {
+    if (!f.amount) return;
+    const to = f.from === p1 ? p2 : p1;
+    set({ ...data, personal: [{ id: uid(), to, ...f }, ...(data.personal || [])] });
+    setF({ ...f, amount: "", desc: "", date: "" });
+  };
+  const del = (id) => set({ ...data, personal: (data.personal || []).filter((x) => x.id !== id) });
+  const toggle = (id) =>
+    set({
+      ...data,
+      personal: (data.personal || []).map((x) =>
+        x.id === id ? { ...x, settled: x.settled === "Yes" ? "No" : "Yes" } : x
+      ),
+    });
+
+  const net = c.net;
+  const cls = Math.abs(net) < 0.005 ? "z" : net > 0 ? "p" : "n";
+  const who = Math.abs(net) < 0.005 ? "Settled" : net > 0 ? p2 + " owes " + p1 : p1 + " owes " + p2;
+
+  return (
+    <div className="wrap">
+      <div className="card">
+        <div className="card-b">
+          <div className="kasse">
+            <div className="lbl">{who}</div>
+            <div className={"big mono " + (Math.abs(net) < 0.005 ? "" : "neg")}>{eur(Math.abs(net))}</div>
+          </div>
+          <div className="split">
+            <div className="col"><div className="t">{p1} paid for {p2}</div><div className="v mono">{eur(c.p1PaidForP2)}</div></div>
+            <div className="col"><div className="t">{p2} paid for {p1}</div><div className="v mono">{eur(c.p2PaidForP1)}</div></div>
+          </div>
+          <div className="note">
+            Private money between the two of you. Nothing here touches any company Kasse.
+            Mark an entry as settled once it's squared up.
+          </div>
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="card-h"><h2>Add a personal payment</h2></div>
+        <div className="card-b">
+          <div className="frow">
+            <div className="fld"><label>Date</label><input type="date" value={f.date} onChange={(e) => setF({ ...f, date: e.target.value })} /></div>
+            <div className="fld"><label>Amount (\u20ac)</label><input type="number" inputMode="decimal" value={f.amount} onChange={(e) => setF({ ...f, amount: e.target.value })} /></div>
+          </div>
+          <div className="fld"><label>Who paid?</label>
+            <select value={f.from} onChange={(e) => setF({ ...f, from: e.target.value })}>
+              <option value={p1}>{p1} paid for {p2}</option>
+              <option value={p2}>{p2} paid for {p1}</option>
+            </select>
+          </div>
+          <div className="fld"><label>Description</label><input value={f.desc} onChange={(e) => setF({ ...f, desc: e.target.value })} placeholder="optional" /></div>
+          <button className="add" onClick={add}>Add payment</button>
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="card-h"><h2>History</h2></div>
+        <div className="card-b">
+          {(data.personal || []).length === 0 && <div className="empty">No entries yet.</div>}
+          {(data.personal || []).map((x) => (
+            <div className="entry" key={x.id} style={x.settled === "Yes" ? { opacity: 0.55 } : {}}>
+              <div>
+                <div className="desc">{x.from} \u2192 {x.to}{x.desc ? " \u00b7 " + x.desc : ""}</div>
+                <div className="date">{x.date || "\u2014"} \u00b7 {x.settled === "Yes" ? "Settled" : "Open"}</div>
+              </div>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <span className="amt mono">{eur(n(x.amount))}</span>
+                <button className="del" style={{ color: "#1c7a44", fontSize: 13, fontWeight: 700 }} onClick={() => toggle(x.id)}>
+                  {x.settled === "Yes" ? "undo" : "\u2713"}
+                </button>
+                <button className="del" onClick={() => del(x.id)}>\u00d7</button>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function Overview({ data }) {
   const { p1, p2, share2 } = data.settings;
   let totKasse = 0, totBalP1 = 0, totBalP2 = 0;
@@ -496,11 +757,13 @@ function Overview({ data }) {
       totBalP2 += r.balP2;
       return { name: co.name, isRE: true, balP2: r.balP2, paid: r.paidByP2, sent: r.sentToP2 };
     }
-    const c = calcCompany(co, share2, p1, p2);
+    const c = calcCompany(co, share2, p1, p2, data.repays, k);
     totKasse += c.kasse; totBalP1 += c.balP1; totBalP2 += c.balP2;
     return { name: co.name, isRE: false, ...c };
   });
   const balCls = (v) => (v > 0 ? "pos" : v < 0 ? "neg" : "");
+  const dbt = calcDebts(data);
+  const prs = calcPersonal(data);
   return (
     <div className="wrap">
       <div className="card">
@@ -539,6 +802,38 @@ function Overview({ data }) {
               )}
             </div>
           ))}
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="card-h"><h2>Companies still owe</h2></div>
+        <div className="card-b">
+          <div className="kpi">
+            <span className="lab">{p1}</span>
+            <span className={"val mono " + (dbt.p1.remaining > 0.005 ? "neg" : "")}>
+              {dbt.p1.remaining > 0.005 ? eur(dbt.p1.remaining) : "Settled"}
+            </span>
+          </div>
+          <div className="kpi">
+            <span className="lab">{p2}</span>
+            <span className={"val mono " + (dbt.p2.remaining > 0.005 ? "neg" : "")}>
+              {dbt.p2.remaining > 0.005 ? eur(dbt.p2.remaining) : "Settled"}
+            </span>
+          </div>
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="card-h"><h2>Personal (between you two)</h2></div>
+        <div className="card-b">
+          <div className="kpi">
+            <span className="lab">
+              {Math.abs(prs.net) < 0.005 ? "Settled" : prs.net > 0 ? p2 + " owes " + p1 : p1 + " owes " + p2}
+            </span>
+            <span className={"val mono " + (Math.abs(prs.net) < 0.005 ? "" : "neg")}>
+              {eur(Math.abs(prs.net))}
+            </span>
+          </div>
         </div>
       </div>
     </div>
@@ -600,6 +895,8 @@ function App() {
   const tabs = [
     ["overview", "Overview"],
     ...Object.keys(data.companies).map((k) => [k, data.companies[k].name]),
+    ["debts", "Debts"],
+    ["personal", "Personal"],
     ["settings", "Settings"],
   ];
 
@@ -619,6 +916,8 @@ function App() {
         </div>
         {tab === "overview" && <Overview data={data} />}
         {tab === "settings" && <Settings data={data} set={set} />}
+        {tab === "debts" && <DebtsView data={data} set={set} />}
+        {tab === "personal" && <PersonalView data={data} set={set} />}
         {tab === "re" && <RealEstateView data={data} set={set} />}
         {data.companies[tab] && tab !== "re" && <CompanyView ckey={tab} data={data} set={set} />}
       </div>
