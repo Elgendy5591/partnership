@@ -171,6 +171,16 @@ body{background:var(--paper);color:var(--ink);
 .entry .amt{font-size:15px;font-weight:800;white-space:nowrap}
 .del{border:0;background:transparent;color:var(--neg);font-size:16px;cursor:pointer;padding:2px 4px;line-height:1}
 .empty{text-align:center;color:var(--muted);font-size:13px;padding:14px 8px}
+.editbtn{border:0;background:transparent;color:var(--brass);font-size:13px;cursor:pointer;padding:2px 4px;font-weight:700}
+.editbox{border:1.5px solid var(--brass);border-radius:11px;padding:11px 12px;margin-bottom:8px;background:#fffdf8}
+.editbox .er{display:flex;gap:8px;margin-bottom:8px}
+.editbox .er>*{flex:1}
+.editbox label{display:block;font-size:11px;font-weight:600;color:var(--ink2);margin-bottom:3px}
+.editbox input,.editbox select{width:100%;border:1.5px solid var(--line);border-radius:8px;padding:8px 9px;font-size:14px;background:#fff;color:var(--ink);outline:none}
+.editbox .acts{display:flex;gap:8px;margin-top:4px}
+.editbox .acts button{flex:1;border:0;border-radius:8px;padding:9px;font-size:13px;font-weight:700;cursor:pointer}
+.editbox .save{background:var(--ink);color:#fff}
+.editbox .cancel{background:var(--paper);color:var(--ink2);border:1.5px solid var(--line)}
 .seg{display:flex;gap:6px;margin-bottom:11px}
 .seg button{flex:1;border:1.5px solid var(--line);background:#fff;color:var(--ink2);padding:9px;border-radius:9px;font-size:13px;font-weight:700;cursor:pointer}
 .seg button.on{background:var(--ink);color:#fff;border-color:var(--ink)}
@@ -188,6 +198,61 @@ body{background:var(--paper);color:var(--ink);
 .note{font-size:12px;color:var(--muted);background:var(--paper);border-radius:9px;padding:10px 12px;margin-top:10px;line-height:1.5}
 .big-btn{width:100%;background:var(--ink);color:#fff;border:0;border-radius:10px;padding:12px;font-size:14px;font-weight:700;cursor:pointer;margin-top:8px}
 `;
+
+/* Reusable row that can flip into an inline edit form.
+   fields: [{key,label,type:'text'|'number'|'date'|'select', options?}]
+   view(): the read-only JSX shown normally.
+   onSave(patch), onDelete(). */
+function EditRow({ entry, fields, view, onSave, onDelete, rowStyle, extraButtons }) {
+  const [editing, setEditing] = React.useState(false);
+  const [form, setForm] = React.useState(entry);
+  React.useEffect(() => { setForm(entry); }, [entry]);
+
+  if (editing) {
+    const chunks = [];
+    for (let i = 0; i < fields.length; i += 2) chunks.push(fields.slice(i, i + 2));
+    return (
+      <div className="editbox">
+        {chunks.map((pair, idx) => (
+          <div className="er" key={idx}>
+            {pair.map((f) => (
+              <div key={f.key}>
+                <label>{f.label}</label>
+                {f.type === "select" ? (
+                  <select value={form[f.key] ?? ""} onChange={(e) => setForm({ ...form, [f.key]: e.target.value })}>
+                    {f.options.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+                  </select>
+                ) : (
+                  <input
+                    type={f.type === "number" ? "number" : f.type === "date" ? "date" : "text"}
+                    inputMode={f.type === "number" ? "decimal" : undefined}
+                    value={form[f.key] ?? ""}
+                    onChange={(e) => setForm({ ...form, [f.key]: e.target.value })}
+                  />
+                )}
+              </div>
+            ))}
+          </div>
+        ))}
+        <div className="acts">
+          <button className="cancel" onClick={() => { setForm(entry); setEditing(false); }}>Cancel</button>
+          <button className="save" onClick={() => { onSave(form); setEditing(false); }}>Save</button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="entry" style={rowStyle}>
+      {view}
+      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+        {extraButtons}
+        <button className="editbtn" onClick={() => setEditing(true)}>edit</button>
+        <button className="del" onClick={onDelete}>\u00d7</button>
+      </div>
+    </div>
+  );
+}
 
 /* --------------------------- Calc per company --------------------------- */
 function calcCompany(co, share2, p1, p2, repays, ckey) {
@@ -253,6 +318,10 @@ function CompanyView({ ckey, data, set }) {
     set({ ...data, companies: { ...data.companies, [ckey]: { ...co, moves: co.moves.filter((m) => m.id !== id) } } });
   const delDraw = (id) =>
     set({ ...data, companies: { ...data.companies, [ckey]: { ...co, draws: co.draws.filter((d) => d.id !== id) } } });
+  const editMove = (patch) =>
+    set({ ...data, companies: { ...data.companies, [ckey]: { ...co, moves: co.moves.map((m) => (m.id === patch.id ? patch : m)) } } });
+  const editDraw = (patch) =>
+    set({ ...data, companies: { ...data.companies, [ckey]: { ...co, draws: co.draws.map((d) => (d.id === patch.id ? patch : d)) } } });
 
   const balClass = (v) => (Math.abs(v) < 0.005 ? "z" : v > 0 ? "p" : "n");
   const balState = (v) =>
@@ -332,28 +401,44 @@ function CompanyView({ ckey, data, set }) {
         <div className="card-b">
           {co.moves.length === 0 && co.draws.length === 0 && <div className="empty">No entries yet.</div>}
           {co.moves.map((m) => (
-            <div className="entry" key={m.id}>
-              <div>
-                <div className="desc">{m.type === "in" ? "Income" : "Expense"}{m.desc ? " · " + m.desc : ""}</div>
-                <div className="date">{m.date || "—"}</div>
-              </div>
-              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                <span className={"amt mono " + (m.type === "in" ? "pos" : "neg")}>{m.type === "in" ? "+" : "−"}{eur(n(m.amount))}</span>
-                <button className="del" onClick={() => delMove(m.id)}>×</button>
-              </div>
-            </div>
+            <EditRow
+              key={m.id}
+              entry={m}
+              fields={[
+                { key: "date", label: "Date", type: "date" },
+                { key: "amount", label: "Amount (€)", type: "number" },
+                { key: "type", label: "Type", type: "select", options: [{ value: "in", label: "Income" }, { value: "out", label: "Expense" }] },
+                { key: "desc", label: "Description", type: "text" },
+              ]}
+              onSave={editMove}
+              onDelete={() => delMove(m.id)}
+              view={
+                <div>
+                  <div className="desc">{m.type === "in" ? "Income" : "Expense"}{m.desc ? " · " + m.desc : ""}</div>
+                  <div className="date">{m.date || "—"} · <span className={m.type === "in" ? "pos" : "neg"}>{m.type === "in" ? "+" : "−"}{eur(n(m.amount))}</span></div>
+                </div>
+              }
+            />
           ))}
           {co.draws.map((d) => (
-            <div className="entry" key={d.id} style={{ background: "#faf7f0" }}>
-              <div>
-                <div className="desc">Taken by {d.who}{d.note ? " · " + d.note : ""}</div>
-                <div className="date">{d.date || "—"}</div>
-              </div>
-              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                <span className="amt mono">{eur(n(d.amount))}</span>
-                <button className="del" onClick={() => delDraw(d.id)}>×</button>
-              </div>
-            </div>
+            <EditRow
+              key={d.id}
+              entry={d}
+              rowStyle={{ background: "#faf7f0" }}
+              fields={[
+                { key: "date", label: "Date", type: "date" },
+                { key: "amount", label: "Amount (€)", type: "number" },
+                { key: "who", label: "Who took it", type: "select", options: [{ value: p1, label: p1 }, { value: p2, label: p2 }] },
+              ]}
+              onSave={editDraw}
+              onDelete={() => delDraw(d.id)}
+              view={
+                <div>
+                  <div className="desc">Taken by {d.who}{d.note ? " · " + d.note : ""}</div>
+                  <div className="date">{d.date || "—"} · {eur(n(d.amount))}</div>
+                </div>
+              }
+            />
           ))}
         </div>
       </div>
@@ -385,6 +470,10 @@ function RealEstateView({ data, set }) {
     set({ ...data, companies: { ...data.companies, re: { ...co, moves: co.moves.filter((m) => m.id !== id) } } });
   const delDraw = (id) =>
     set({ ...data, companies: { ...data.companies, re: { ...co, draws: co.draws.filter((d) => d.id !== id) } } });
+  const editMove = (patch) =>
+    set({ ...data, companies: { ...data.companies, re: { ...co, moves: co.moves.map((m) => (m.id === patch.id ? patch : m)) } } });
+  const editDraw = (patch) =>
+    set({ ...data, companies: { ...data.companies, re: { ...co, draws: co.draws.map((d) => (d.id === patch.id ? patch : d)) } } });
 
   const remaining = Math.max(0, -c.balP2);
   const balCls = Math.abs(c.balP2) < 0.005 ? "z" : c.balP2 > 0 ? "p" : "n";
@@ -461,36 +550,55 @@ function RealEstateView({ data, set }) {
         <div className="card-b">
           {co.moves.length === 0 && co.draws.length === 0 && <div className="empty">No entries yet.</div>}
           {co.moves.map((m) => (
-            <div className="entry" key={m.id}>
-              <div>
-                <div className="desc">{p2} paid{m.desc ? " \u00b7 " + m.desc : ""}</div>
-                <div className="date">
-                  {m.date || "\u2014"}
-                  {n(m.egp) > 0 ? " \u00b7 " + n(m.egp).toLocaleString() + " EGP" : ""}
-                  {n(m.rate) > 0 ? " @ " + n(m.rate) : ""}
+            <EditRow
+              key={m.id}
+              entry={m}
+              fields={[
+                { key: "date", label: "Date", type: "date" },
+                { key: "amount", label: "Amount (€)", type: "number" },
+                { key: "egp", label: "EGP (optional)", type: "number" },
+                { key: "rate", label: "Rate (optional)", type: "number" },
+                { key: "desc", label: "Description", type: "text" },
+              ]}
+              onSave={editMove}
+              onDelete={() => delMove(m.id)}
+              view={
+                <div>
+                  <div className="desc">{p2} paid{m.desc ? " · " + m.desc : ""}</div>
+                  <div className="date">
+                    {m.date || "—"} · {eur(n(m.amount))}
+                    {n(m.egp) > 0 ? " · " + n(m.egp).toLocaleString() + " EGP" : ""}
+                    {n(m.rate) > 0 ? " @ " + n(m.rate) : ""}
+                  </div>
                 </div>
-              </div>
-              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                <span className="amt mono neg">{eur(n(m.amount))}</span>
-                <button className="del" onClick={() => delMove(m.id)}>\u00d7</button>
-              </div>
-            </div>
+              }
+            />
           ))}
           {co.draws.map((d) => (
-            <div className="entry" key={d.id} style={{ background: "#faf7f0" }}>
-              <div>
-                <div className="desc">{p1} sent to {p2}{d.desc ? " \u00b7 " + d.desc : ""}</div>
-                <div className="date">
-                  {d.date || "\u2014"}
-                  {n(d.egp) > 0 ? " \u00b7 " + n(d.egp).toLocaleString() + " EGP" : ""}
-                  {n(d.rate) > 0 ? " @ " + n(d.rate) : ""}
+            <EditRow
+              key={d.id}
+              entry={d}
+              rowStyle={{ background: "#faf7f0" }}
+              fields={[
+                { key: "date", label: "Date", type: "date" },
+                { key: "amount", label: "Amount (€)", type: "number" },
+                { key: "egp", label: "EGP (optional)", type: "number" },
+                { key: "rate", label: "Rate (optional)", type: "number" },
+                { key: "desc", label: "How money reached him", type: "text" },
+              ]}
+              onSave={editDraw}
+              onDelete={() => delDraw(d.id)}
+              view={
+                <div>
+                  <div className="desc">{p1} sent to {p2}{d.desc ? " · " + d.desc : ""}</div>
+                  <div className="date">
+                    {d.date || "—"} · {eur(n(d.amount))}
+                    {n(d.egp) > 0 ? " · " + n(d.egp).toLocaleString() + " EGP" : ""}
+                    {n(d.rate) > 0 ? " @ " + n(d.rate) : ""}
+                  </div>
                 </div>
-              </div>
-              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                <span className="amt mono pos">{eur(n(d.amount))}</span>
-                <button className="del" onClick={() => delDraw(d.id)}>\u00d7</button>
-              </div>
-            </div>
+              }
+            />
           ))}
         </div>
       </div>
@@ -536,6 +644,10 @@ function DebtsView({ data, set }) {
   };
   const delDebt = (id) => set({ ...data, debts: (data.debts || []).filter((x) => x.id !== id) });
   const delRepay = (id) => set({ ...data, repays: (data.repays || []).filter((x) => x.id !== id) });
+  const editDebt = (patch) => set({ ...data, debts: (data.debts || []).map((x) => (x.id === patch.id ? patch : x)) });
+  const editRepay = (patch) => set({ ...data, repays: (data.repays || []).map((x) => (x.id === patch.id ? patch : x)) });
+  const coOpts = cashCos.map((k) => ({ value: k, label: data.companies[k].name }));
+  const whoOpts = [{ value: p1, label: p1 }, { value: p2, label: p2 }];
 
   const row = (name, o) => (
     <div className={"bal " + (o.remaining > 0.005 ? "n" : "z")} style={{ marginTop: 8 }}>
@@ -618,28 +730,46 @@ function DebtsView({ data, set }) {
         <div className="card-b">
           {(data.debts || []).length === 0 && (data.repays || []).length === 0 && <div className="empty">No entries yet.</div>}
           {(data.debts || []).map((d) => (
-            <div className="entry" key={d.id}>
-              <div>
-                <div className="desc">{data.companies[d.co] ? data.companies[d.co].name : d.co} owes {d.who}{d.desc ? " \u00b7 " + d.desc : ""}</div>
-                <div className="date">{d.date || "\u2014"}</div>
-              </div>
-              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                <span className="amt mono neg">{eur(n(d.amount))}</span>
-                <button className="del" onClick={() => delDebt(d.id)}>\u00d7</button>
-              </div>
-            </div>
+            <EditRow
+              key={d.id}
+              entry={d}
+              fields={[
+                { key: "date", label: "Date", type: "date" },
+                { key: "amount", label: "Amount (€)", type: "number" },
+                { key: "co", label: "Company", type: "select", options: coOpts },
+                { key: "who", label: "Owes who", type: "select", options: whoOpts },
+                { key: "desc", label: "Description", type: "text" },
+              ]}
+              onSave={editDebt}
+              onDelete={() => delDebt(d.id)}
+              view={
+                <div>
+                  <div className="desc">{data.companies[d.co] ? data.companies[d.co].name : d.co} owes {d.who}{d.desc ? " · " + d.desc : ""}</div>
+                  <div className="date">{d.date || "—"} · {eur(n(d.amount))}</div>
+                </div>
+              }
+            />
           ))}
           {(data.repays || []).map((r) => (
-            <div className="entry" key={r.id} style={{ background: "#faf7f0" }}>
-              <div>
-                <div className="desc">{data.companies[r.co] ? data.companies[r.co].name : r.co} repaid {r.who}</div>
-                <div className="date">{r.date || "\u2014"}</div>
-              </div>
-              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                <span className="amt mono pos">{eur(n(r.amount))}</span>
-                <button className="del" onClick={() => delRepay(r.id)}>\u00d7</button>
-              </div>
-            </div>
+            <EditRow
+              key={r.id}
+              entry={r}
+              rowStyle={{ background: "#faf7f0" }}
+              fields={[
+                { key: "date", label: "Date", type: "date" },
+                { key: "amount", label: "Amount (€)", type: "number" },
+                { key: "co", label: "Company", type: "select", options: coOpts },
+                { key: "who", label: "Paid to", type: "select", options: whoOpts },
+              ]}
+              onSave={editRepay}
+              onDelete={() => delRepay(r.id)}
+              view={
+                <div>
+                  <div className="desc">{data.companies[r.co] ? data.companies[r.co].name : r.co} repaid {r.who}</div>
+                  <div className="date">{r.date || "—"} · {eur(n(r.amount))}</div>
+                </div>
+              }
+            />
           ))}
         </div>
       </div>
@@ -672,6 +802,10 @@ function PersonalView({ data, set }) {
     setF({ ...f, amount: "", desc: "", date: "" });
   };
   const del = (id) => set({ ...data, personal: (data.personal || []).filter((x) => x.id !== id) });
+  const editPersonal = (patch) => {
+    const to = patch.from === p1 ? p2 : p1;
+    set({ ...data, personal: (data.personal || []).map((x) => (x.id === patch.id ? { ...patch, to } : x)) });
+  };
   const toggle = (id) =>
     set({
       ...data,
@@ -726,19 +860,30 @@ function PersonalView({ data, set }) {
         <div className="card-b">
           {(data.personal || []).length === 0 && <div className="empty">No entries yet.</div>}
           {(data.personal || []).map((x) => (
-            <div className="entry" key={x.id} style={x.settled === "Yes" ? { opacity: 0.55 } : {}}>
-              <div>
-                <div className="desc">{x.from} \u2192 {x.to}{x.desc ? " \u00b7 " + x.desc : ""}</div>
-                <div className="date">{x.date || "\u2014"} \u00b7 {x.settled === "Yes" ? "Settled" : "Open"}</div>
-              </div>
-              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                <span className="amt mono">{eur(n(x.amount))}</span>
-                <button className="del" style={{ color: "#1c7a44", fontSize: 13, fontWeight: 700 }} onClick={() => toggle(x.id)}>
-                  {x.settled === "Yes" ? "undo" : "\u2713"}
+            <EditRow
+              key={x.id}
+              entry={x}
+              rowStyle={x.settled === "Yes" ? { opacity: 0.55 } : undefined}
+              fields={[
+                { key: "date", label: "Date", type: "date" },
+                { key: "amount", label: "Amount (€)", type: "number" },
+                { key: "from", label: "Who paid", type: "select", options: [{ value: p1, label: p1 + " paid for " + p2 }, { value: p2, label: p2 + " paid for " + p1 }] },
+                { key: "desc", label: "Description", type: "text" },
+              ]}
+              onSave={editPersonal}
+              onDelete={() => del(x.id)}
+              extraButtons={
+                <button className="editbtn" style={{ color: "#1c7a44" }} onClick={() => toggle(x.id)}>
+                  {x.settled === "Yes" ? "undo" : "✓"}
                 </button>
-                <button className="del" onClick={() => del(x.id)}>\u00d7</button>
-              </div>
-            </div>
+              }
+              view={
+                <div>
+                  <div className="desc">{x.from} → {x.to}{x.desc ? " · " + x.desc : ""}</div>
+                  <div className="date">{x.date || "—"} · {eur(n(x.amount))} · {x.settled === "Yes" ? "Settled" : "Open"}</div>
+                </div>
+              }
+            />
           ))}
         </div>
       </div>
