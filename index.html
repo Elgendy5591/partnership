@@ -436,6 +436,27 @@ function CompanyView({ ckey, data, set }) {
   const editDraw = (patch) =>
     set({ ...data, companies: { ...data.companies, [ckey]: { ...co, draws: co.draws.map((d) => (d.id === patch.id ? patch : d)) } } });
 
+  // Transfer cash to another company (final transfer: money out here, in there)
+  const otherCos = Object.keys(data.companies).filter((k) => k !== ckey && k !== "re");
+  const [tr, setTr] = useState({ date: "", to: otherCos[0] || "", amount: "", desc: "" });
+  const doTransfer = () => {
+    if (!tr.amount || !tr.to) return;
+    const toCo = data.companies[tr.to];
+    const fromName = co.name, toName = toCo.name;
+    const linkId = uid();
+    const outMove = { id: uid(), type: "out", date: tr.date, amount: tr.amount, desc: "Transfer to " + toName + (tr.desc ? " · " + tr.desc : ""), transfer: linkId };
+    const inMove = { id: uid(), type: "in", date: tr.date, amount: tr.amount, desc: "Transfer from " + fromName + (tr.desc ? " · " + tr.desc : ""), transfer: linkId };
+    set({
+      ...data,
+      companies: {
+        ...data.companies,
+        [ckey]: { ...co, moves: [outMove, ...co.moves] },
+        [tr.to]: { ...toCo, moves: [inMove, ...toCo.moves] },
+      },
+    });
+    setTr({ date: "", to: otherCos[0] || "", amount: "", desc: "" });
+  };
+
   const balClass = (v) => (Math.abs(v) < 0.005 ? "z" : v > 0 ? "p" : "n");
   const balState = (v) =>
     Math.abs(v) < 0.005 ? "Settled" : v > 0 ? "Took extra (+)" : "Still owed (−)";
@@ -560,6 +581,29 @@ function CompanyView({ ckey, data, set }) {
           )}
         </div>
       </div>
+
+      {/* Transfer to another company */}
+      {otherCos.length > 0 && (
+        <div className="card">
+          <div className="card-h"><h2>Transfer cash to another company</h2></div>
+          <div className="card-b">
+            <div className="note" style={{ marginTop: 0 }}>
+              Use this when this company pays cash for another one. It records money OUT here and IN there automatically. No debt is created.
+            </div>
+            <div className="frow">
+              <div className="fld"><label>Date &amp; time</label><input type="datetime-local" value={tr.date} onChange={(e) => setTr({ ...tr, date: e.target.value })} /></div>
+              <div className="fld"><label>Amount (€)</label><input type="number" inputMode="decimal" value={tr.amount} onChange={(e) => setTr({ ...tr, amount: e.target.value })} /></div>
+            </div>
+            <div className="fld"><label>Send to which company?</label>
+              <select value={tr.to} onChange={(e) => setTr({ ...tr, to: e.target.value })}>
+                {otherCos.map((k) => <option key={k} value={k}>{data.companies[k].name}</option>)}
+              </select>
+            </div>
+            <div className="fld"><label>Description (optional)</label><input value={tr.desc} onChange={(e) => setTr({ ...tr, desc: e.target.value })} placeholder="what is this transfer for?" /></div>
+            <button className="add" style={{ background: "var(--ink)" }} onClick={doTransfer}>Record transfer</button>
+          </div>
+        </div>
+      )}
 
       {/* History */}
       <div className="card">
@@ -1282,21 +1326,30 @@ function Settings({ data, set }) {
   const updName = (ck, v) =>
     set({ ...data, companies: { ...data.companies, [ck]: { ...data.companies[ck], name: v } } });
 
+  const [exportView, setExportView] = useState(null); // {title, text} shown in-app
+
   const download = (content, filename, type) => {
-    const blob = new Blob([content], { type });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url; a.download = filename; a.click();
-    URL.revokeObjectURL(url);
+    // Try a normal download (works in real browsers)
+    try {
+      const blob = new Blob([content], { type });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = filename; a.click();
+      URL.revokeObjectURL(url);
+    } catch (e) {}
   };
 
-  const exportData = () => download(JSON.stringify(data, null, 2), "partnership-backup.json", "application/json");
+  const exportData = () => {
+    const text = JSON.stringify(data, null, 2);
+    download(text, "partnership-backup.json", "application/json");
+    setExportView({ title: "Backup (JSON)", text, hint: "This is your full backup. Copy it and save it somewhere safe (email it to yourself, save in Notes). To restore later, use \u201cRestore from a file\u201d or paste it back." });
+  };
 
   const csvCell = (v) => {
     const str = String(v == null ? "" : v);
     return /[",\n]/.test(str) ? '"' + str.replace(/"/g, '""') + '"' : str;
   };
-  const exportCSV = () => {
+  const buildCSV = () => {
     const rows = [["Company", "Type", "Date", "Amount (EUR)", "Who", "Description"]];
     Object.keys(data.companies).forEach((ck) => {
       const co = data.companies[ck];
@@ -1312,12 +1365,16 @@ function Settings({ data, set }) {
         rows.push([coNm, "Debt payment", p.date || "", n(p.amount), d.person || "", p.desc || ""]));
     });
     (data.personal || []).forEach((d) => {
-      rows.push(["Personal", "Personal debt", d.date || "", n(d.amount), d.from + " → " + d.to, d.desc || ""]);
+      rows.push(["Personal", "Personal debt", d.date || "", n(d.amount), d.from + " \u2192 " + d.to, d.desc || ""]);
       (d.payments || []).forEach((p) =>
-        rows.push(["Personal", "Personal payment", p.date || "", n(p.amount), d.from + " → " + d.to, p.desc || ""]));
+        rows.push(["Personal", "Personal payment", p.date || "", n(p.amount), d.from + " \u2192 " + d.to, p.desc || ""]));
     });
-    const csv = "\uFEFF" + rows.map((r) => r.map(csvCell).join(",")).join("\n");
-    download(csv, "partnership-report.csv", "text/csv;charset=utf-8");
+    return rows.map((r) => r.map(csvCell).join(",")).join("\n");
+  };
+  const exportCSV = () => {
+    const csv = buildCSV();
+    download("\uFEFF" + csv, "partnership-report.csv", "text/csv;charset=utf-8");
+    setExportView({ title: "Excel / CSV data", text: csv, hint: "Copy everything below, open Excel or Google Sheets, and paste. It will fill the columns automatically. (On the app, a file download may be blocked, so copying is the reliable way.)" });
   };
 
   const exportPDF = () => {
@@ -1325,23 +1382,35 @@ function Settings({ data, set }) {
     Object.keys(data.companies).forEach((ck) => {
       const co = data.companies[ck];
       const all = [
-        ...(co.moves || []).map((m) => ({ t: m.type === "in" ? "Income" : "Expense", date: m.date, amount: n(m.amount), who: "", desc: m.desc, sign: m.type === "in" ? "+" : "−" })),
-        ...(co.draws || []).map((d) => ({ t: "Withdrawal", date: d.date, amount: n(d.amount), who: d.who, desc: d.desc, sign: "−" })),
+        ...(co.moves || []).map((m) => ({ t: m.type === "in" ? "Income" : "Expense", date: m.date, amount: n(m.amount), who: "", desc: m.desc, sign: m.type === "in" ? "+" : "\u2212" })),
+        ...(co.draws || []).map((d) => ({ t: "Withdrawal", date: d.date, amount: n(d.amount), who: d.who, desc: d.desc, sign: "\u2212" })),
       ].sort((a, b) => String(b.date).localeCompare(String(a.date)));
       if (all.length === 0) return;
       rowsHtml.push('<h2>' + co.name + '</h2><table><tr><th>Date</th><th>Type</th><th>Who</th><th>Description</th><th style="text-align:right">Amount</th></tr>' +
-        all.map((r) => '<tr><td>' + (r.date || "") + '</td><td>' + r.t + '</td><td>' + (r.who || "") + '</td><td>' + (r.desc || "") + '</td><td style="text-align:right">' + r.sign + "€" + r.amount.toLocaleString("en-US", { minimumFractionDigits: 2 }) + '</td></tr>').join("") +
+        all.map((r) => '<tr><td>' + (r.date || "") + '</td><td>' + r.t + '</td><td>' + (r.who || "") + '</td><td>' + (r.desc || "") + '</td><td style="text-align:right">' + r.sign + "\u20ac" + r.amount.toLocaleString("en-US", { minimumFractionDigits: 2 }) + '</td></tr>').join("") +
         '</table>');
     });
-    const win = window.open("", "_blank");
-    if (!win) { alert("Please allow pop-ups to export PDF."); return; }
-    win.document.write('<html><head><title>Partnership Report</title><style>' +
+    const html = '<html><head><title>Partnership Report</title><style>' +
       'body{font-family:Arial,sans-serif;padding:24px;color:#13233b}h1{font-size:20px}h2{font-size:15px;margin-top:22px;border-bottom:2px solid #b08322;padding-bottom:4px}' +
       'table{width:100%;border-collapse:collapse;font-size:12px;margin-top:6px}th,td{border-bottom:1px solid #ddd;padding:6px 8px;text-align:left}th{background:#f4f1ea}' +
-      '</style></head><body><h1>Partnership Report — ' + new Date().toLocaleDateString() + '</h1>' + rowsHtml.join("") +
-      '<p style="margin-top:24px;color:#888;font-size:11px">Generated from Partnership Ledger</p></body></html>');
-    win.document.close();
-    setTimeout(() => win.print(), 400);
+      '</style></head><body><h1>Partnership Report \u2014 ' + new Date().toLocaleDateString() + '</h1>' + rowsHtml.join("") +
+      '<p style="margin-top:24px;color:#888;font-size:11px">Generated from Partnership Ledger</p></body></html>';
+    // Try opening a print window; if blocked (WebView), fall back to writing into this document.
+    let win = null;
+    try { win = window.open("", "_blank"); } catch (e) {}
+    if (win) {
+      win.document.write(html);
+      win.document.close();
+      setTimeout(() => { try { win.print(); } catch (e) {} }, 400);
+    } else {
+      const iframe = document.createElement("iframe");
+      iframe.style.position = "fixed"; iframe.style.right = "0"; iframe.style.bottom = "0";
+      iframe.style.width = "0"; iframe.style.height = "0"; iframe.style.border = "0";
+      document.body.appendChild(iframe);
+      const doc = iframe.contentWindow.document;
+      doc.open(); doc.write(html); doc.close();
+      setTimeout(() => { try { iframe.contentWindow.focus(); iframe.contentWindow.print(); } catch (e) {} }, 500);
+    }
   };
 
   const importData = (e) => {
@@ -1362,7 +1431,29 @@ function Settings({ data, set }) {
   };
 
   const [showBackups, setShowBackups] = useState(false);
+  const [pasteMode, setPasteMode] = useState(false);
+  const [pasteText, setPasteText] = useState("");
   const backups = loadBackups();
+  const copyText = (t) => {
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(t);
+        alert("Copied!");
+        return;
+      }
+    } catch (e) {}
+    alert("Select the text and copy it manually.");
+  };
+  const restoreFromPaste = () => {
+    try {
+      const parsed = JSON.parse(pasteText);
+      if (!parsed.companies || !parsed.settings) { alert("This doesn't look like a valid backup."); return; }
+      if (window.confirm("Replace ALL current data with this backup?")) {
+        set(mergeDefaults(parsed));
+        setPasteMode(false); setPasteText("");
+      }
+    } catch (e) { alert("Could not read this text. Make sure you pasted the full backup."); }
+  };
   const restoreBackup = (snapshot) => {
     try {
       const parsed = JSON.parse(snapshot);
@@ -1394,8 +1485,21 @@ function Settings({ data, set }) {
         <div className="card-b">
           <button className="big-btn" onClick={exportCSV}>Export as Excel (CSV)</button>
           <button className="big-btn" style={{ marginTop: 8, background: "var(--brass)" }} onClick={exportPDF}>Export as PDF (print)</button>
-          <button className="big-btn" style={{ marginTop: 8, background: "var(--ink2)" }} onClick={exportData}>Export backup file (JSON)</button>
-          <div className="note">CSV opens in Excel. PDF opens a printable report you can save as PDF. JSON is a full backup you can restore below.</div>
+          <button className="big-btn" style={{ marginTop: 8, background: "var(--ink2)" }} onClick={exportData}>Export backup (JSON)</button>
+          <div className="note">On the app, file downloads may be blocked — so each export also shows the data on screen to copy. PDF opens a printable report.</div>
+
+          {exportView && (
+            <div className="editbox" style={{ marginTop: 12 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                <strong style={{ fontSize: 14 }}>{exportView.title}</strong>
+                <button className="removebtn" onClick={() => setExportView(null)}>Close</button>
+              </div>
+              <div className="note" style={{ marginTop: 0, marginBottom: 8 }}>{exportView.hint}</div>
+              <textarea readOnly value={exportView.text} onFocus={(e) => e.target.select()}
+                style={{ width: "100%", height: 160, fontSize: 12, fontFamily: "monospace", border: "1.5px solid var(--line)", borderRadius: 8, padding: 8, boxSizing: "border-box" }} />
+              <button className="add" style={{ marginTop: 8 }} onClick={() => copyText(exportView.text)}>Copy to clipboard</button>
+            </div>
+          )}
         </div>
       </div>
 
@@ -1406,6 +1510,17 @@ function Settings({ data, set }) {
             Restore from a file
             <input type="file" accept="application/json,.json" onChange={importData} style={{ display: "none" }} />
           </label>
+          <button className="big-btn" style={{ marginTop: 8, background: "var(--ink)" }} onClick={() => setPasteMode(!pasteMode)}>
+            {pasteMode ? "Cancel paste" : "Restore by pasting text"}
+          </button>
+          {pasteMode && (
+            <div className="editbox" style={{ marginTop: 10 }}>
+              <div className="note" style={{ marginTop: 0 }}>Paste a JSON backup you copied earlier, then press Restore.</div>
+              <textarea value={pasteText} onChange={(e) => setPasteText(e.target.value)} placeholder="paste backup here…"
+                style={{ width: "100%", height: 120, fontSize: 12, fontFamily: "monospace", border: "1.5px solid var(--line)", borderRadius: 8, padding: 8, boxSizing: "border-box" }} />
+              <button className="add" style={{ marginTop: 8 }} onClick={restoreFromPaste}>Restore from pasted text</button>
+            </div>
+          )}
           <button className="big-btn" style={{ marginTop: 8, background: "var(--paper)", color: "var(--ink)", border: "1.5px solid var(--line)" }} onClick={() => setShowBackups(!showBackups)}>
             {showBackups ? "Hide" : "Show"} automatic backups ({backups.length})
           </button>
@@ -1420,7 +1535,7 @@ function Settings({ data, set }) {
               ))}
             </div>
           )}
-          <div className="note">The app keeps the last {MAX_BACKUPS} versions automatically on this device. Export a JSON file regularly for a safe off-device copy.</div>
+          <div className="note">The app keeps the last {MAX_BACKUPS} versions automatically on this device. Export a JSON backup regularly and save it off-device (email/Notes).</div>
         </div>
       </div>
 
