@@ -1,0 +1,1697 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="theme-color" content="#13233b" />
+<link rel="manifest" href="manifest.json" />
+<link rel="apple-touch-icon" href="icon-192.png" />
+<title>Partnership Ledger</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap" rel="stylesheet">
+<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+<style>html,body{margin:0;background:#f4f1ea}</style>
+</head>
+<body>
+<div id="root"></div>
+<script>
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", function () {
+    navigator.serviceWorker.register("sw.js").catch(function (e) { console.log("SW register failed", e); });
+  });
+}
+</script>
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useMemo } = React;
+
+
+
+
+
+
+/* =========================================================================
+   Partnership Tracker v2 — Mohamed (80%) & Ahmed (20%)
+   Each company: Einnahmen (income), Ausgaben (expenses), Kasse (cash),
+   withdrawals per partner, and a clear +/- balance per partner.
+   ========================================================================= */
+
+const SUPABASE_URL = "https://bwpoawofjajmmmblttfm.supabase.co";
+const SUPABASE_KEY = "sb_publishable_zhryO5D1io9JfclGACkrEg_RmxVHImp";
+const ROW_KEY = "shared";
+const STORAGE_KEY = "partnership_v2";
+const SYNC_ON = SUPABASE_URL.indexOf("supabase.co") !== -1 && SUPABASE_KEY.length > 20;
+
+const DEFAULT_DATA = {
+  settings: { p1: "Mohamed", p2: "Ahmed", share2: 0.2 },
+  // each company: { moves:[{id,date,desc,type:'in'|'out',amount}], draws:[{id,date,who,amount}] }
+  companies: {
+    c1: { name: "Company 1", moves: [], draws: [] },
+    c2: { name: "Company 2", moves: [], draws: [] },
+    c3: { name: "Company 3", moves: [], draws: [] },
+    re: { name: "Real Estate", moves: [], draws: [] },
+  },
+  // Company debts. Each: {id,date,dir:'coOwes'|'owesCo',co,person,amount,desc,payments:[{id,date,amount,desc}]}
+  //   dir 'coOwes'  = the company owes the person (repayments leave the company Kasse)
+  //   dir 'owesCo'  = the person owes the company (repayments come INTO the company Kasse)
+  debts: [],
+  // legacy (old simple repays) — kept so old data still loads; no longer written
+  repays: [],
+  // Personal debts between anyone (not tied to any Kasse):
+  //   {id,date,dir:'aOwesB',from,to,amount,desc,payments:[{id,date,amount,desc}]}
+  personal: [],
+  // saved counterparty names the user has typed, to reuse from a dropdown
+  people: [],
+};
+
+async function loadAll() {
+  if (SYNC_ON) {
+    try {
+      const res = await fetch(
+        SUPABASE_URL + "/rest/v1/app_state?key=eq." + ROW_KEY + "&select=data",
+        { headers: { apikey: SUPABASE_KEY, Authorization: "Bearer " + SUPABASE_KEY } }
+      );
+      const rows = await res.json();
+      if (rows && rows[0] && rows[0].data) {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(rows[0].data));
+        return mergeDefaults(rows[0].data);
+      }
+    } catch (e) { console.error("cloud load failed", e); }
+  }
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (raw) return mergeDefaults(JSON.parse(raw));
+  } catch (e) {}
+  return JSON.parse(JSON.stringify(DEFAULT_DATA));
+}
+
+function mergeDefaults(d) {
+  const out = JSON.parse(JSON.stringify(DEFAULT_DATA));
+  if (d.settings) out.settings = { ...out.settings, ...d.settings };
+  if (d.companies) {
+    for (const k of Object.keys(out.companies)) {
+      if (d.companies[k]) {
+        out.companies[k].name = d.companies[k].name || out.companies[k].name;
+        out.companies[k].moves = d.companies[k].moves || [];
+        out.companies[k].draws = d.companies[k].draws || [];
+      }
+    }
+  }
+  out.debts = (d.debts || []).map((x) => x.payments ? x : { ...x, dir: x.dir || "coOwes", person: x.person || x.who, payments: [] });
+  out.repays = d.repays || [];
+  out.personal = (d.personal || []).map((x) => x.payments ? x : { ...x, dir: x.dir || "aOwesB", payments: [] });
+  out.people = d.people || [];
+  return out;
+}
+
+async function saveAll(data) {
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(data)); } catch (e) {}
+  pushBackup(data);
+  if (SYNC_ON) {
+    try {
+      await fetch(SUPABASE_URL + "/rest/v1/app_state?on_conflict=key", {
+        method: "POST",
+        headers: {
+          apikey: SUPABASE_KEY,
+          Authorization: "Bearer " + SUPABASE_KEY,
+          "Content-Type": "application/json",
+          Prefer: "resolution=merge-duplicates",
+        },
+        body: JSON.stringify({ key: ROW_KEY, data }),
+      });
+    } catch (e) { console.error("cloud save failed", e); }
+  }
+}
+
+const uid = () => Math.random().toString(36).slice(2, 10);
+
+// ---- rolling local backups: keep the last N snapshots automatically ----
+const BACKUP_KEY = "partnership_backups_v1";
+const MAX_BACKUPS = 10;
+function loadBackups() {
+  try { return JSON.parse(localStorage.getItem(BACKUP_KEY) || "[]"); } catch (e) { return []; }
+}
+function pushBackup(data) {
+  try {
+    const list = loadBackups();
+    const last = list[0];
+    const snapshot = JSON.stringify(data);
+    // skip if identical to the most recent snapshot
+    if (last && last.snapshot === snapshot) return;
+    list.unshift({ at: new Date().toISOString(), snapshot });
+    localStorage.setItem(BACKUP_KEY, JSON.stringify(list.slice(0, MAX_BACKUPS)));
+  } catch (e) {}
+}
+
+const n = (v) => (isNaN(parseFloat(v)) ? 0 : parseFloat(v));
+const eur = (v) =>
+  (v < 0 ? "-" : "") + "€" +
+  Math.abs(v).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+// Show a date, plus time if the stored value includes one (datetime-local: YYYY-MM-DDTHH:MM)
+const fmtDate = (s) => {
+  if (!s) return "—";
+  const t = String(s).match(/^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2})/);
+  if (t) return t[1] + " · " + t[2];
+  return String(s);
+};
+
+/* ------------------------------- Styles --------------------------------- */
+const css = `
+:root{
+  --ink:#13233b; --ink2:#2c3e57; --paper:#f4f1ea; --card:#ffffff;
+  --line:#e3dccf; --brass:#b08322;
+  --pos:#1c7a44; --pos-bg:#e3f1e7; --neg:#b23021; --neg-bg:#f8e2de;
+  --muted:#7b8494; --shadow:0 1px 3px rgba(19,35,59,.08),0 6px 20px rgba(19,35,59,.06);
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body,#root{margin:0;height:100%}
+body{background:var(--paper);color:var(--ink);
+  font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;}
+.app{max-width:560px;margin:0 auto;padding:0 0 90px;min-height:100%}
+.mono{font-variant-numeric:tabular-nums;font-family:'SF Mono',ui-monospace,Menlo,Consolas,monospace}
+.top{position:sticky;top:0;z-index:20;background:var(--ink);color:#fff;
+  padding:13px 18px;border-bottom:3px solid var(--brass)}
+.top h1{margin:0;font-size:16px;font-weight:700}
+.top p{margin:2px 0 0;font-size:12px;color:#aeb9cb}
+.sync{position:absolute;right:16px;top:16px;font-size:11px;color:#aeb9cb;display:flex;align-items:center;gap:5px}
+.dot{width:7px;height:7px;border-radius:50%;background:#5a6b86}
+.dot.on{background:#46c277}
+.tabs{display:flex;gap:4px;overflow-x:auto;padding:10px 12px;background:var(--card);
+  border-bottom:1px solid var(--line);position:sticky;top:62px;z-index:19;scrollbar-width:none}
+.tabs::-webkit-scrollbar{display:none}
+.tab{flex:0 0 auto;border:1px solid var(--line);background:var(--paper);color:var(--ink2);
+  padding:8px 13px;border-radius:999px;font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap}
+.tab.active{background:var(--ink);color:#fff;border-color:var(--ink)}
+.wrap{padding:15px 14px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;
+  box-shadow:var(--shadow);margin-bottom:13px;overflow:hidden}
+.card-h{padding:12px 15px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center}
+.card-h h2{margin:0;font-size:14px;font-weight:700}
+.card-b{padding:13px 15px}
+.kasse{text-align:center;padding:6px 0 2px}
+.kasse .lbl{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}
+.kasse .big{font-size:32px;font-weight:800;letter-spacing:-.5px;margin:3px 0}
+.split{display:flex;gap:10px;margin-top:10px}
+.split .col{flex:1;background:var(--paper);border-radius:10px;padding:9px;text-align:center}
+.split .col .t{font-size:11px;color:var(--muted)}
+.split .col .v{font-size:14px;font-weight:700;margin-top:2px}
+.kpi{display:flex;justify-content:space-between;align-items:baseline;padding:9px 0;border-bottom:1px dashed var(--line)}
+.kpi:last-child{border-bottom:0}
+.kpi .lab{font-size:13px;color:var(--ink2);flex:1;padding-right:10px}
+.kpi .val{font-size:15px;font-weight:700}
+.pos{color:var(--pos)} .neg{color:var(--neg)}
+.bal{border-radius:11px;padding:11px 13px;margin-top:8px;display:flex;justify-content:space-between;align-items:center}
+.bal.p{background:var(--pos-bg)} .bal.n{background:var(--neg-bg)} .bal.z{background:var(--paper)}
+.bal .who{font-size:14px;font-weight:700}
+.bal .st{font-size:11px;color:var(--muted);margin-top:1px}
+.bal .amt{font-size:17px;font-weight:800}
+.entry{border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center;gap:8px}
+.entry .desc{font-weight:600;font-size:14px}
+.entry .date{font-size:11.5px;color:var(--muted);margin-top:1px}
+.entry .amt{font-size:15px;font-weight:800;white-space:nowrap}
+.del{border:0;background:transparent;color:var(--neg);font-size:16px;cursor:pointer;padding:2px 4px;line-height:1}
+.empty{text-align:center;color:var(--muted);font-size:13px;padding:14px 8px}
+.editbtn{border:0;background:transparent;color:var(--brass);font-size:13px;cursor:pointer;padding:2px 4px;font-weight:700}
+.removebtn{border:0;background:transparent;color:var(--neg);font-size:13px;cursor:pointer;padding:2px 4px;font-weight:700}
+.editbox{border:1.5px solid var(--brass);border-radius:11px;padding:11px 12px;margin-bottom:8px;background:#fffdf8}
+.editbox .er{display:flex;gap:8px;margin-bottom:8px}
+.editbox .er>*{flex:1}
+.editbox label{display:block;font-size:11px;font-weight:600;color:var(--ink2);margin-bottom:3px}
+.editbox input,.editbox select{width:100%;border:1.5px solid var(--line);border-radius:8px;padding:8px 9px;font-size:14px;background:#fff;color:var(--ink);outline:none}
+.editbox .acts{display:flex;gap:8px;margin-top:4px}
+.editbox .acts button{flex:1;border:0;border-radius:8px;padding:9px;font-size:13px;font-weight:700;cursor:pointer}
+.editbox .save{background:var(--ink);color:#fff}
+.editbox .cancel{background:var(--paper);color:var(--ink2);border:1.5px solid var(--line)}
+.seg{display:flex;gap:6px;margin-bottom:11px}
+.seg button{flex:1;border:1.5px solid var(--line);background:#fff;color:var(--ink2);padding:9px;border-radius:9px;font-size:13px;font-weight:700;cursor:pointer}
+.seg button.on{background:var(--ink);color:#fff;border-color:var(--ink)}
+.seg3 button{padding:9px 4px;font-size:12.5px}
+.seg button.onIn{background:#1c9e63;border-color:#1c9e63;color:#fff}
+.seg button.onOut{background:#e0524a;border-color:#e0524a;color:#fff}
+.seg button.onDraw{background:#9a5bd6;border-color:#9a5bd6;color:#fff}
+.add.btnIn{background:#1c9e63}
+.add.btnOut{background:#e0524a}
+.add.btnDraw{background:#9a5bd6}
+.tiles{display:grid;grid-template-columns:1fr 1fr;gap:9px;margin-bottom:12px}
+.tile{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:13px 14px;box-shadow:0 1px 2px rgba(20,30,50,.04)}
+.tile .tl{font-size:12px;color:var(--ink2);font-weight:600;margin-bottom:6px}
+.tile .tv{font-size:19px;font-weight:800}
+.fld{margin-bottom:10px}
+.fld label{display:block;font-size:12px;font-weight:600;color:var(--ink2);margin-bottom:5px}
+.fld input,.fld select{width:100%;border:1.5px solid var(--line);border-radius:10px;padding:11px 12px;font-size:15px;background:#fff;color:var(--ink);outline:none}
+.fld input:focus,.fld select:focus{border-color:var(--brass)}
+.frow{display:flex;gap:9px}.frow>*{flex:1}
+.add{width:100%;background:var(--brass);color:#fff;border:0;border-radius:10px;padding:12px;font-size:15px;font-weight:700;cursor:pointer}
+.add:active{transform:translateY(1px)}
+.set-row{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:11px 0;border-bottom:1px dashed var(--line)}
+.set-row:last-child{border-bottom:0}
+.set-row label{font-size:13.5px;color:var(--ink2);flex:1}
+.set-row input{width:130px;border:1.5px solid var(--line);border-radius:9px;padding:9px 11px;font-size:15px;text-align:right}
+.note{font-size:12px;color:var(--muted);background:var(--paper);border-radius:9px;padding:10px 12px;margin-top:10px;line-height:1.5}
+.big-btn{width:100%;background:var(--ink);color:#fff;border:0;border-radius:10px;padding:12px;font-size:14px;font-weight:700;cursor:pointer;margin-top:8px}
+`;
+
+/* Reusable row that can flip into an inline edit form.
+   fields: [{key,label,type:'text'|'number'|'date'|'select', options?}]
+   view(): the read-only JSX shown normally.
+   onSave(patch), onDelete(). */
+function EditRow({ entry, fields, view, onSave, onDelete, rowStyle, extraButtons }) {
+  const [editing, setEditing] = React.useState(false);
+  const [form, setForm] = React.useState(entry);
+  React.useEffect(() => { setForm(entry); }, [entry]);
+
+  if (editing) {
+    const chunks = [];
+    for (let i = 0; i < fields.length; i += 2) chunks.push(fields.slice(i, i + 2));
+    return (
+      <div className="editbox">
+        {chunks.map((pair, idx) => (
+          <div className="er" key={idx}>
+            {pair.map((f) => (
+              <div key={f.key}>
+                <label>{f.label}</label>
+                {f.type === "select" ? (
+                  <select value={form[f.key] ?? ""} onChange={(e) => setForm({ ...form, [f.key]: e.target.value })}>
+                    {f.options.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+                  </select>
+                ) : (
+                  <input
+                    type={f.type === "number" ? "number" : f.type === "date" ? "date" : f.type === "datetime" ? "datetime-local" : "text"}
+                    inputMode={f.type === "number" ? "decimal" : undefined}
+                    value={form[f.key] ?? ""}
+                    onChange={(e) => setForm({ ...form, [f.key]: e.target.value })}
+                  />
+                )}
+              </div>
+            ))}
+          </div>
+        ))}
+        <div className="acts">
+          <button className="cancel" onClick={() => { setForm(entry); setEditing(false); }}>Cancel</button>
+          <button className="save" onClick={() => { onSave(form); setEditing(false); }}>Save</button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="entry" style={rowStyle}>
+      {view}
+      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+        {extraButtons}
+        <button className="editbtn" onClick={() => setEditing(true)}>edit</button>
+        <button className="removebtn" onClick={() => { if (window.confirm("Remove this entry? This can't be undone.")) onDelete(); }}>Remove</button>
+      </div>
+    </div>
+  );
+}
+
+/* --------------------------- Calc per company --------------------------- */
+function calcCompany(co, share2, p1, p2, debts, ckey) {
+  let income = 0, expense = 0;
+  co.moves.forEach((m) => {
+    if (m.type === "in") income += n(m.amount);
+    else expense += n(m.amount);
+  });
+  const net = income - expense;                    // صافي قبل السحب
+  let drawP1 = 0, drawP2 = 0;
+  co.draws.forEach((d) => {
+    if (d.who === p1) drawP1 += n(d.amount);
+    else if (d.who === p2) drawP2 += n(d.amount);
+  });
+  const totalDraw = drawP1 + drawP2;
+  // debt payments touching THIS company's Kasse:
+  //  - company paying back what it owes  -> money leaves  (−)
+  //  - someone paying back the company    -> money comes in (+)
+  let kasseDebtEffect = 0;
+  (debts || []).forEach((d) => {
+    if (d.co !== ckey) return;
+    const paid = (d.payments || []).reduce((s, p) => s + n(p.amount), 0);
+    if (d.dir === "coOwes") kasseDebtEffect -= paid;
+    else if (d.dir === "owesCo") kasseDebtEffect += paid;
+  });
+  const repaid = -kasseDebtEffect; // for display: positive means net money left
+  const kasse = net - totalDraw + kasseDebtEffect;
+  const dueP1 = net * (1 - share2);                // نصيب محمد المستحق
+  const dueP2 = net * share2;                       // نصيب أحمد المستحق
+  const balP1 = drawP1 - dueP1;                     // + واخد زيادة / - لسه ليه
+  const balP2 = drawP2 - dueP2;
+  return { income, expense, net, kasse, repaid, drawP1, drawP2, dueP1, dueP2, balP1, balP2 };
+}
+
+/* ---- Real Estate: simple ledger, all amounts in EUR.
+       Ahmed pays installments, Mohamed pays him back the same amount.
+       EGP amount + rate are optional notes for documentation only —
+       they do NOT affect any calculation.  ---- */
+function calcRE(co) {
+  let paidByP2 = 0;
+  co.moves.forEach((m) => { paidByP2 += n(m.amount); });
+  let sentToP2 = 0;
+  co.draws.forEach((d) => { sentToP2 += n(d.amount); });
+  const balP2 = sentToP2 - paidByP2;   // − لسه ليه / + اتسلم زيادة
+  return { paidByP2, sentToP2, balP2 };
+}
+
+/* ------------------------------ Components ------------------------------ */
+function CompanyView({ ckey, data, set }) {
+  const co = data.companies[ckey];
+  const { p1, p2, share2 } = data.settings;
+  const c = calcCompany(co, share2, p1, p2, data.debts, ckey);
+
+  // ---- unified list of entries (income / expense / draw) ----
+  const entries = [
+    ...co.moves.map((m) => ({ ...m, kind: m.type })),          // kind: 'in' | 'out'
+    ...co.draws.map((d) => ({ ...d, kind: "draw" })),
+  ];
+
+  // ---- filter state ----
+  const now = new Date();
+  const [fMonth, setFMonth] = useState("all");   // 'all' or '01'..'12'
+  const [fYear, setFYear] = useState("all");     // 'all' or e.g. '2026'
+  const [fType, setFType] = useState("all");     // 'all' | 'in' | 'out' | 'draw'
+  const [fSearch, setFSearch] = useState("");
+
+  const ym = (dateStr) => {
+    if (!dateStr) return { y: "", m: "" };
+    // Trust an explicit YYYY-MM prefix (avoids timezone shifting the month)
+    const mm = String(dateStr).match(/^(\d{4})-(\d{2})/);
+    if (mm) return { y: mm[1], m: mm[2] };
+    const d = new Date(dateStr);
+    if (isNaN(d)) return { y: "", m: "" };
+    return { y: String(d.getFullYear()), m: String(d.getMonth() + 1).padStart(2, "0") };
+  };
+
+  // available years from data
+  const yearsSet = new Set();
+  entries.forEach((e) => { const { y } = ym(e.date); if (y) yearsSet.add(y); });
+  const years = Array.from(yearsSet).sort().reverse();
+
+  const months = [
+    ["01", "January"], ["02", "February"], ["03", "March"], ["04", "April"],
+    ["05", "May"], ["06", "June"], ["07", "July"], ["08", "August"],
+    ["09", "September"], ["10", "October"], ["11", "November"], ["12", "December"],
+  ];
+
+  const passFilter = (e) => {
+    const { y, m } = ym(e.date);
+    if (fMonth !== "all" && m !== fMonth) return false;
+    if (fYear !== "all" && y !== fYear) return false;
+    if (fType !== "all" && e.kind !== fType) return false;
+    if (fSearch.trim()) {
+      const q = fSearch.trim().toLowerCase();
+      const hay = ((e.desc || "") + " " + (e.who || "")).toLowerCase();
+      if (hay.indexOf(q) === -1) return false;
+    }
+    return true;
+  };
+
+  const filtered = entries.filter(passFilter).sort((a, b) => String(b.date).localeCompare(String(a.date)));
+
+  // filtered totals (for the tiles)
+  let fIncome = 0, fExpense = 0, fDraw = 0;
+  filtered.forEach((e) => {
+    if (e.kind === "in") fIncome += n(e.amount);
+    else if (e.kind === "out") fExpense += n(e.amount);
+    else if (e.kind === "draw") fDraw += n(e.amount);
+  });
+  const filterActive = fMonth !== "all" || fYear !== "all" || fType !== "all" || fSearch.trim() !== "";
+  const resetFilter = () => { setFMonth("all"); setFYear("all"); setFType("all"); setFSearch(""); };
+
+  // ---- add forms ----
+  const [mode, setMode] = useState("in"); // in | out | draw
+  const [mv, setMv] = useState({ date: "", desc: "", amount: "" });
+  const [dw, setDw] = useState({ date: "", who: p1, amount: "", desc: "" });
+
+  const addMove = () => {
+    if (!mv.amount) return;
+    const co2 = { ...co, moves: [{ id: uid(), type: mode, ...mv }, ...co.moves] };
+    set({ ...data, companies: { ...data.companies, [ckey]: co2 } });
+    setMv({ date: "", desc: "", amount: "" });
+  };
+  const addDraw = () => {
+    if (!dw.amount) return;
+    const co2 = { ...co, draws: [{ id: uid(), ...dw }, ...co.draws] };
+    set({ ...data, companies: { ...data.companies, [ckey]: co2 } });
+    setDw({ date: "", who: p1, amount: "", desc: "" });
+  };
+  const delMove = (id) =>
+    set({ ...data, companies: { ...data.companies, [ckey]: { ...co, moves: co.moves.filter((m) => m.id !== id) } } });
+  const delDraw = (id) =>
+    set({ ...data, companies: { ...data.companies, [ckey]: { ...co, draws: co.draws.filter((d) => d.id !== id) } } });
+  const editMove = (patch) =>
+    set({ ...data, companies: { ...data.companies, [ckey]: { ...co, moves: co.moves.map((m) => (m.id === patch.id ? patch : m)) } } });
+  const editDraw = (patch) =>
+    set({ ...data, companies: { ...data.companies, [ckey]: { ...co, draws: co.draws.map((d) => (d.id === patch.id ? patch : d)) } } });
+
+  // Transfer cash to another company (final transfer: money out here, in there)
+  const otherCos = Object.keys(data.companies).filter((k) => k !== ckey && k !== "re");
+  const [tr, setTr] = useState({ date: "", to: otherCos[0] || "", amount: "", desc: "" });
+  const doTransfer = () => {
+    if (!tr.amount || !tr.to) return;
+    const toCo = data.companies[tr.to];
+    const fromName = co.name, toName = toCo.name;
+    const linkId = uid();
+    const outMove = { id: uid(), type: "out", date: tr.date, amount: tr.amount, desc: "Transfer to " + toName + (tr.desc ? " · " + tr.desc : ""), transfer: linkId };
+    const inMove = { id: uid(), type: "in", date: tr.date, amount: tr.amount, desc: "Transfer from " + fromName + (tr.desc ? " · " + tr.desc : ""), transfer: linkId };
+    set({
+      ...data,
+      companies: {
+        ...data.companies,
+        [ckey]: { ...co, moves: [outMove, ...co.moves] },
+        [tr.to]: { ...toCo, moves: [inMove, ...toCo.moves] },
+      },
+    });
+    setTr({ date: "", to: otherCos[0] || "", amount: "", desc: "" });
+  };
+
+  const balClass = (v) => (Math.abs(v) < 0.005 ? "z" : v > 0 ? "p" : "n");
+  const balState = (v) =>
+    Math.abs(v) < 0.005 ? "Settled" : v > 0 ? "Took extra (+)" : "Still owed (−)";
+
+  const kindLabel = (k) => (k === "in" ? "Income" : k === "out" ? "Expense" : "Withdrawal");
+
+  return (
+    <div className="wrap">
+      {/* Total balance (always cumulative, never changes with filter) */}
+      <div className="card">
+        <div className="card-b">
+          <div className="kasse">
+            <div className="lbl">Total balance (Kasse) — all time</div>
+            <div className={"big mono " + (c.kasse >= 0 ? "" : "neg")}>{eur(c.kasse)}</div>
+          </div>
+        </div>
+      </div>
+
+      {/* Summary tiles (respect the filter) */}
+      <div className="tiles">
+        <div className="tile">
+          <div className="tl">{filterActive ? "Income (filtered)" : "Income (all)"}</div>
+          <div className="tv pos mono">{eur(fIncome)}</div>
+        </div>
+        <div className="tile">
+          <div className="tl">{filterActive ? "Expense (filtered)" : "Expense (all)"}</div>
+          <div className="tv neg mono">{eur(fExpense)}</div>
+        </div>
+        <div className="tile">
+          <div className="tl">Withdrawals</div>
+          <div className="tv mono" style={{ color: "#9a5bd6" }}>{eur(fDraw)}</div>
+        </div>
+        <div className="tile">
+          <div className="tl">Entries</div>
+          <div className="tv mono">{filtered.length}</div>
+        </div>
+      </div>
+
+      {/* Filter */}
+      <div className="card">
+        <div className="card-h"><h2>Filter</h2></div>
+        <div className="card-b">
+          <div className="frow">
+            <div className="fld"><label>Month</label>
+              <select value={fMonth} onChange={(e) => setFMonth(e.target.value)}>
+                <option value="all">All months</option>
+                {months.map(([v, nm]) => <option key={v} value={v}>{nm}</option>)}
+              </select>
+            </div>
+            <div className="fld"><label>Year</label>
+              <select value={fYear} onChange={(e) => setFYear(e.target.value)}>
+                <option value="all">All years</option>
+                {years.map((y) => <option key={y} value={y}>{y}</option>)}
+              </select>
+            </div>
+          </div>
+          <div className="fld"><label>Type</label>
+            <select value={fType} onChange={(e) => setFType(e.target.value)}>
+              <option value="all">All types</option>
+              <option value="in">Income only</option>
+              <option value="out">Expense only</option>
+              <option value="draw">Withdrawals only</option>
+            </select>
+          </div>
+          <div className="fld"><label>Search description / name</label>
+            <input value={fSearch} onChange={(e) => setFSearch(e.target.value)} placeholder="type to search…" />
+          </div>
+          {filterActive && <button className="add" style={{ background: "var(--paper)", color: "var(--ink2)", border: "1.5px solid var(--line)" }} onClick={resetFilter}>Reset filter</button>}
+        </div>
+      </div>
+
+      {/* Balances */}
+      <div className="card">
+        <div className="card-h"><h2>Balances</h2></div>
+        <div className="card-b">
+          <div className={"bal " + balClass(c.balP1)}>
+            <div><div className="who">{p1} (80%)</div><div className="st">Due {eur(c.dueP1)} · Took {eur(c.drawP1)} · {balState(c.balP1)}</div></div>
+            <div className={"amt mono " + (c.balP1 > 0 ? "pos" : c.balP1 < 0 ? "neg" : "")}>{eur(c.balP1)}</div>
+          </div>
+          <div className={"bal " + balClass(c.balP2)} style={{ marginTop: 8 }}>
+            <div><div className="who">{p2} (20%)</div><div className="st">Due {eur(c.dueP2)} · Took {eur(c.drawP2)} · {balState(c.balP2)}</div></div>
+            <div className={"amt mono " + (c.balP2 > 0 ? "pos" : c.balP2 < 0 ? "neg" : "")}>{eur(c.balP2)}</div>
+          </div>
+          <div className="note">− means still owed to them · + means they took extra · 0 means settled.</div>
+        </div>
+      </div>
+
+      {/* Add entry */}
+      <div className="card">
+        <div className="card-h"><h2>Add entry</h2></div>
+        <div className="card-b">
+          <div className="seg seg3">
+            <button className={mode === "in" ? "on onIn" : ""} onClick={() => setMode("in")}>+ Income</button>
+            <button className={mode === "out" ? "on onOut" : ""} onClick={() => setMode("out")}>− Expense</button>
+            <button className={mode === "draw" ? "on onDraw" : ""} onClick={() => setMode("draw")}>Withdrawal</button>
+          </div>
+
+          {mode !== "draw" ? (
+            <>
+              <div className="frow">
+                <div className="fld"><label>Date &amp; time</label><input type="datetime-local" value={mv.date} onChange={(e) => setMv({ ...mv, date: e.target.value })} /></div>
+                <div className="fld"><label>Amount (€)</label><input type="number" inputMode="decimal" value={mv.amount} onChange={(e) => setMv({ ...mv, amount: e.target.value })} /></div>
+              </div>
+              <div className="fld"><label>Description</label><input value={mv.desc} onChange={(e) => setMv({ ...mv, desc: e.target.value })} placeholder="what is this for?" /></div>
+              <button className={"add " + (mode === "in" ? "btnIn" : "btnOut")} onClick={addMove}>Add {mode === "in" ? "income" : "expense"}</button>
+            </>
+          ) : (
+            <>
+              <div className="frow">
+                <div className="fld"><label>Date &amp; time</label><input type="datetime-local" value={dw.date} onChange={(e) => setDw({ ...dw, date: e.target.value })} /></div>
+                <div className="fld"><label>Amount (€)</label><input type="number" inputMode="decimal" value={dw.amount} onChange={(e) => setDw({ ...dw, amount: e.target.value })} /></div>
+              </div>
+              <div className="fld"><label>Who took it?</label>
+                <select value={dw.who} onChange={(e) => setDw({ ...dw, who: e.target.value })}>
+                  <option value={p1}>{p1}</option>
+                  <option value={p2}>{p2}</option>
+                </select>
+              </div>
+              <div className="fld"><label>Description (how was it taken?)</label><input value={dw.desc} onChange={(e) => setDw({ ...dw, desc: e.target.value })} placeholder="e.g. cash, bank transfer…" /></div>
+              <button className="add btnDraw" onClick={addDraw}>Record withdrawal</button>
+            </>
+          )}
+        </div>
+      </div>
+
+      {/* Transfer to another company */}
+      {otherCos.length > 0 && (
+        <div className="card">
+          <div className="card-h"><h2>Transfer cash to another company</h2></div>
+          <div className="card-b">
+            <div className="note" style={{ marginTop: 0 }}>
+              Use this when this company pays cash for another one. It records money OUT here and IN there automatically. No debt is created.
+            </div>
+            <div className="frow">
+              <div className="fld"><label>Date &amp; time</label><input type="datetime-local" value={tr.date} onChange={(e) => setTr({ ...tr, date: e.target.value })} /></div>
+              <div className="fld"><label>Amount (€)</label><input type="number" inputMode="decimal" value={tr.amount} onChange={(e) => setTr({ ...tr, amount: e.target.value })} /></div>
+            </div>
+            <div className="fld"><label>Send to which company?</label>
+              <select value={tr.to} onChange={(e) => setTr({ ...tr, to: e.target.value })}>
+                {otherCos.map((k) => <option key={k} value={k}>{data.companies[k].name}</option>)}
+              </select>
+            </div>
+            <div className="fld"><label>Description (optional)</label><input value={tr.desc} onChange={(e) => setTr({ ...tr, desc: e.target.value })} placeholder="what is this transfer for?" /></div>
+            <button className="add" style={{ background: "var(--ink)" }} onClick={doTransfer}>Record transfer</button>
+          </div>
+        </div>
+      )}
+
+      {/* History */}
+      <div className="card">
+        <div className="card-h"><h2>History{filterActive ? " (filtered)" : ""}</h2></div>
+        <div className="card-b">
+          {filtered.length === 0 && <div className="empty">No entries{filterActive ? " for this filter" : " yet"}.</div>}
+          {filtered.map((e) =>
+            e.kind === "draw" ? (
+              <EditRow
+                key={e.id}
+                entry={e}
+                rowStyle={{ borderLeft: "4px solid #9a5bd6", background: "#faf5ff" }}
+                fields={[
+                  { key: "date", label: "Date & time", type: "datetime" },
+                  { key: "amount", label: "Amount (€)", type: "number" },
+                  { key: "who", label: "Who took it", type: "select", options: [{ value: p1, label: p1 }, { value: p2, label: p2 }] },
+                  { key: "desc", label: "Description", type: "text" },
+                ]}
+                onSave={editDraw}
+                onDelete={() => delDraw(e.id)}
+                view={
+                  <div>
+                    <div className="desc">Withdrawal · {e.who}{e.desc ? " · " + e.desc : ""}</div>
+                    <div className="date">{fmtDate(e.date)} · <span style={{ color: "#9a5bd6" }}>{eur(n(e.amount))}</span></div>
+                  </div>
+                }
+              />
+            ) : (
+              <EditRow
+                key={e.id}
+                entry={e}
+                rowStyle={{ borderLeft: "4px solid " + (e.kind === "in" ? "#1c9e63" : "#e0524a") }}
+                fields={[
+                  { key: "date", label: "Date & time", type: "datetime" },
+                  { key: "amount", label: "Amount (€)", type: "number" },
+                  { key: "type", label: "Type", type: "select", options: [{ value: "in", label: "Income" }, { value: "out", label: "Expense" }] },
+                  { key: "desc", label: "Description", type: "text" },
+                ]}
+                onSave={editMove}
+                onDelete={() => delMove(e.id)}
+                view={
+                  <div>
+                    <div className="desc">{kindLabel(e.kind)}{e.desc ? " · " + e.desc : ""}</div>
+                    <div className="date">{fmtDate(e.date)} · <span className={e.kind === "in" ? "pos" : "neg"}>{e.kind === "in" ? "+" : "−"}{eur(n(e.amount))}</span></div>
+                  </div>
+                }
+              />
+            )
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function RealEstateView({ data, set }) {
+  const co = data.companies.re;
+  const { p1, p2 } = data.settings;
+  const c = calcRE(co);
+
+  const [mv, setMv] = useState({ date: "", desc: "", amount: "", egp: "", rate: "" });
+  const [dw, setDw] = useState({ date: "", amount: "", egp: "", rate: "", desc: "" });
+
+  const addPaid = () => {
+    if (!mv.amount) return;
+    const co2 = { ...co, moves: [{ id: uid(), type: "in", ...mv }, ...co.moves] };
+    set({ ...data, companies: { ...data.companies, re: co2 } });
+    setMv({ date: "", desc: "", amount: "", egp: "", rate: mv.rate });
+  };
+  const addSent = () => {
+    if (!dw.amount) return;
+    const co2 = { ...co, draws: [{ id: uid(), who: p2, ...dw }, ...co.draws] };
+    set({ ...data, companies: { ...data.companies, re: co2 } });
+    setDw({ date: "", amount: "", egp: "", rate: dw.rate, desc: "" });
+  };
+  const delMove = (id) =>
+    set({ ...data, companies: { ...data.companies, re: { ...co, moves: co.moves.filter((m) => m.id !== id) } } });
+  const delDraw = (id) =>
+    set({ ...data, companies: { ...data.companies, re: { ...co, draws: co.draws.filter((d) => d.id !== id) } } });
+  const editMove = (patch) =>
+    set({ ...data, companies: { ...data.companies, re: { ...co, moves: co.moves.map((m) => (m.id === patch.id ? patch : m)) } } });
+  const editDraw = (patch) =>
+    set({ ...data, companies: { ...data.companies, re: { ...co, draws: co.draws.map((d) => (d.id === patch.id ? patch : d)) } } });
+
+  const remaining = Math.max(0, -c.balP2);
+  const balCls = Math.abs(c.balP2) < 0.005 ? "z" : c.balP2 > 0 ? "p" : "n";
+  const balState = Math.abs(c.balP2) < 0.005 ? "Settled" : c.balP2 > 0 ? "Got extra (+)" : "Still owed (−)";
+
+  return (
+    <div className="wrap">
+      <div className="card">
+        <div className="card-b">
+          <div className="kasse">
+            <div className="lbl">{p1} still owes {p2}</div>
+            <div className={"big mono " + (remaining > 0 ? "neg" : "")}>{eur(remaining)}</div>
+          </div>
+          <div className="split">
+            <div className="col"><div className="t">{p2} paid</div><div className="v mono">{eur(c.paidByP2)}</div></div>
+            <div className="col"><div className="t">{p1} sent back</div><div className="v mono">{eur(c.sentToP2)}</div></div>
+            <div className="col"><div className="t">Balance</div><div className={"v mono " + (c.balP2 > 0 ? "pos" : c.balP2 < 0 ? "neg" : "")}>{eur(c.balP2)}</div></div>
+          </div>
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="card-h"><h2>Balance</h2></div>
+        <div className="card-b">
+          <div className={"bal " + balCls}>
+            <div>
+              <div className="who">{p2}</div>
+              <div className="st">Paid {eur(c.paidByP2)} · Received {eur(c.sentToP2)} · {balState}</div>
+            </div>
+            <div className={"amt mono " + (c.balP2 > 0 ? "pos" : c.balP2 < 0 ? "neg" : "")}>{eur(c.balP2)}</div>
+          </div>
+          <div className="note">
+            {p2} pays the property installments from his own pocket. {p1} pays him back the same amount in €.
+            The EGP amount and rate are optional — recorded for your reference only, they don't affect the balance.
+            <br />− means {p1} still owes him · + means he received more · 0 means settled.
+          </div>
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="card-h"><h2>{p2} paid an installment</h2></div>
+        <div className="card-b">
+          <div className="frow">
+            <div className="fld"><label>Date &amp; time</label><input type="datetime-local" value={mv.date} onChange={(e) => setMv({ ...mv, date: e.target.value })} /></div>
+            <div className="fld"><label>Amount (€)</label><input type="number" inputMode="decimal" value={mv.amount} onChange={(e) => setMv({ ...mv, amount: e.target.value })} /></div>
+          </div>
+          <div className="frow">
+            <div className="fld"><label>EGP paid (optional)</label><input type="number" inputMode="decimal" value={mv.egp} onChange={(e) => setMv({ ...mv, egp: e.target.value })} placeholder="for the record" /></div>
+            <div className="fld"><label>Rate that day (optional)</label><input type="number" inputMode="decimal" value={mv.rate} onChange={(e) => setMv({ ...mv, rate: e.target.value })} placeholder="1 € = ?" /></div>
+          </div>
+          <div className="fld"><label>Description</label><input value={mv.desc} onChange={(e) => setMv({ ...mv, desc: e.target.value })} placeholder="optional" /></div>
+          <button className="add" onClick={addPaid}>Add installment</button>
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="card-h"><h2>{p1} sent money to {p2}</h2></div>
+        <div className="card-b">
+          <div className="frow">
+            <div className="fld"><label>Date &amp; time</label><input type="datetime-local" value={dw.date} onChange={(e) => setDw({ ...dw, date: e.target.value })} /></div>
+            <div className="fld"><label>Amount (€)</label><input type="number" inputMode="decimal" value={dw.amount} onChange={(e) => setDw({ ...dw, amount: e.target.value })} /></div>
+          </div>
+          <div className="frow">
+            <div className="fld"><label>EGP received (optional)</label><input type="number" inputMode="decimal" value={dw.egp} onChange={(e) => setDw({ ...dw, egp: e.target.value })} placeholder="for the record" /></div>
+            <div className="fld"><label>Rate that day (optional)</label><input type="number" inputMode="decimal" value={dw.rate} onChange={(e) => setDw({ ...dw, rate: e.target.value })} placeholder="1 € = ?" /></div>
+          </div>
+          <div className="fld"><label>How did the money reach him? (description)</label><input value={dw.desc} onChange={(e) => setDw({ ...dw, desc: e.target.value })} placeholder="e.g. bank transfer, cash, via someone…" /></div>
+          <button className="add" onClick={addSent}>Record payment</button>
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="card-h"><h2>History</h2></div>
+        <div className="card-b">
+          {co.moves.length === 0 && co.draws.length === 0 && <div className="empty">No entries yet.</div>}
+          {co.moves.map((m) => (
+            <EditRow
+              key={m.id}
+              entry={m}
+              fields={[
+                { key: "date", label: "Date", type: "date" },
+                { key: "amount", label: "Amount (€)", type: "number" },
+                { key: "egp", label: "EGP (optional)", type: "number" },
+                { key: "rate", label: "Rate (optional)", type: "number" },
+                { key: "desc", label: "Description", type: "text" },
+              ]}
+              onSave={editMove}
+              onDelete={() => delMove(m.id)}
+              view={
+                <div>
+                  <div className="desc">{p2} paid{m.desc ? " · " + m.desc : ""}</div>
+                  <div className="date">
+                    {m.date || "—"} · {eur(n(m.amount))}
+                    {n(m.egp) > 0 ? " · " + n(m.egp).toLocaleString() + " EGP" : ""}
+                    {n(m.rate) > 0 ? " @ " + n(m.rate) : ""}
+                  </div>
+                </div>
+              }
+            />
+          ))}
+          {co.draws.map((d) => (
+            <EditRow
+              key={d.id}
+              entry={d}
+              rowStyle={{ background: "#faf7f0" }}
+              fields={[
+                { key: "date", label: "Date", type: "date" },
+                { key: "amount", label: "Amount (€)", type: "number" },
+                { key: "egp", label: "EGP (optional)", type: "number" },
+                { key: "rate", label: "Rate (optional)", type: "number" },
+                { key: "desc", label: "How money reached him", type: "text" },
+              ]}
+              onSave={editDraw}
+              onDelete={() => delDraw(d.id)}
+              view={
+                <div>
+                  <div className="desc">{p1} sent to {p2}{d.desc ? " · " + d.desc : ""}</div>
+                  <div className="date">
+                    {d.date || "—"} · {eur(n(d.amount))}
+                    {n(d.egp) > 0 ? " · " + n(d.egp).toLocaleString() + " EGP" : ""}
+                    {n(d.rate) > 0 ? " @ " + n(d.rate) : ""}
+                  </div>
+                </div>
+              }
+            />
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+/* =========================== DEBTS (companies) ===========================
+   Each debt has a direction, a counterparty name, description, amount, and a
+   list of payments. dir 'coOwes' = company owes person; 'owesCo' = person owes
+   the company. Payments move money in/out of that company's Kasse (handled in
+   calcCompany). Here we just compute remaining per debt and totals. */
+function debtPaid(d) { return (d.payments || []).reduce((s, p) => s + n(p.amount), 0); }
+function debtRemaining(d) { return n(d.amount) - debtPaid(d); }
+
+function DebtsView({ data, set }) {
+  const { p1, p2 } = data.settings;
+  const cashCos = Object.keys(data.companies).filter((k) => k !== "re");
+  const coName = (k) => (data.companies[k] ? data.companies[k].name : k);
+
+  // suggested names: partners + any saved people
+  const savedPeople = data.people || [];
+  const nameOptions = Array.from(new Set([p1, p2, ...savedPeople]));
+
+  const [f, setF] = useState({ date: "", dir: "coOwes", co: cashCos[0], person: p1, newPerson: "", amount: "", desc: "" });
+  const [payFor, setPayFor] = useState(null); // debt id being paid
+  const [pay, setPay] = useState({ date: "", amount: "", desc: "" });
+
+  const rememberPerson = (name) => {
+    if (!name) return data.people || [];
+    if (name === p1 || name === p2) return data.people || [];
+    if ((data.people || []).includes(name)) return data.people || [];
+    return [...(data.people || []), name];
+  };
+
+  const addDebt = () => {
+    const person = f.person === "__new__" ? f.newPerson.trim() : f.person;
+    if (!f.amount || !person) return;
+    const people = rememberPerson(person);
+    set({
+      ...data,
+      people,
+      debts: [{ id: uid(), date: f.date, dir: f.dir, co: f.co, person, amount: f.amount, desc: f.desc, payments: [] }, ...(data.debts || [])],
+    });
+    setF({ ...f, amount: "", desc: "", newPerson: "", date: "" });
+  };
+  const delDebt = (id) => set({ ...data, debts: (data.debts || []).filter((x) => x.id !== id) });
+  const editDebt = (patch) => set({ ...data, debts: (data.debts || []).map((x) => (x.id === patch.id ? { ...x, ...patch } : x)) });
+
+  const addPayment = (debtId) => {
+    if (!pay.amount) return;
+    set({
+      ...data,
+      debts: (data.debts || []).map((d) =>
+        d.id === debtId ? { ...d, payments: [{ id: uid(), ...pay }, ...(d.payments || [])] } : d
+      ),
+    });
+    setPay({ date: "", amount: "", desc: "" });
+    setPayFor(null);
+  };
+  const delPayment = (debtId, payId) =>
+    set({
+      ...data,
+      debts: (data.debts || []).map((d) =>
+        d.id === debtId ? { ...d, payments: (d.payments || []).filter((p) => p.id !== payId) } : d
+      ),
+    });
+
+  // totals per direction
+  let coOwesTotal = 0, owesCoTotal = 0;
+  (data.debts || []).forEach((d) => {
+    const rem = debtRemaining(d);
+    if (d.dir === "coOwes") coOwesTotal += rem;
+    else owesCoTotal += rem;
+  });
+
+  const dirLabel = (d) => (d.dir === "coOwes" ? coName(d.co) + " owes " + d.person : d.person + " owes " + coName(d.co));
+
+  return (
+    <div className="wrap">
+      <div className="card">
+        <div className="card-h"><h2>Open debts</h2></div>
+        <div className="card-b">
+          <div className="kpi"><span className="lab">Companies still owe others</span><span className={"val mono " + (coOwesTotal > 0.005 ? "neg" : "")}>{eur(coOwesTotal)}</span></div>
+          <div className="kpi"><span className="lab">Others still owe the companies</span><span className={"val mono " + (owesCoTotal > 0.005 ? "pos" : "")}>{eur(owesCoTotal)}</span></div>
+          <div className="note">
+            Pick a direction for each debt. Repayments move money in or out of the
+            chosen company's Kasse. You can pay in parts — the remaining shows below.
+          </div>
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="card-h"><h2>Add a debt</h2></div>
+        <div className="card-b">
+          <div className="fld"><label>Direction</label>
+            <select value={f.dir} onChange={(e) => setF({ ...f, dir: e.target.value })}>
+              <option value="coOwes">Company owes someone</option>
+              <option value="owesCo">Someone owes the company</option>
+            </select>
+          </div>
+          <div className="frow">
+            <div className="fld"><label>Date</label><input type="date" value={f.date} onChange={(e) => setF({ ...f, date: e.target.value })} /></div>
+            <div className="fld"><label>Amount (€)</label><input type="number" inputMode="decimal" value={f.amount} onChange={(e) => setF({ ...f, amount: e.target.value })} /></div>
+          </div>
+          <div className="frow">
+            <div className="fld"><label>Which company?</label>
+              <select value={f.co} onChange={(e) => setF({ ...f, co: e.target.value })}>
+                {cashCos.map((k) => <option key={k} value={k}>{coName(k)}</option>)}
+              </select>
+            </div>
+            <div className="fld"><label>{f.dir === "coOwes" ? "Owes who?" : "Who owes?"}</label>
+              <select value={f.person} onChange={(e) => setF({ ...f, person: e.target.value })}>
+                {nameOptions.map((nm) => <option key={nm} value={nm}>{nm}</option>)}
+                <option value="__new__">+ New name…</option>
+              </select>
+            </div>
+          </div>
+          {f.person === "__new__" && (
+            <div className="fld"><label>New name</label><input value={f.newPerson} onChange={(e) => setF({ ...f, newPerson: e.target.value })} placeholder="type a name" /></div>
+          )}
+          <div className="fld"><label>Description</label><input value={f.desc} onChange={(e) => setF({ ...f, desc: e.target.value })} placeholder="what is this debt for?" /></div>
+          <button className="add" onClick={addDebt}>Add debt</button>
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="card-h"><h2>Debts</h2></div>
+        <div className="card-b">
+          {(data.debts || []).length === 0 && <div className="empty">No debts yet.</div>}
+          {(data.debts || []).map((d) => {
+            const rem = debtRemaining(d);
+            const paid = debtPaid(d);
+            const done = rem < 0.005;
+            return (
+              <div className="entry" key={d.id} style={{ display: "block", background: done ? "#eef5ee" : "#fff" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 }}>
+                  <div>
+                    <div className="desc">{dirLabel(d)}{d.desc ? " · " + d.desc : ""}</div>
+                    <div className="date">{d.date || "—"} · amount {eur(n(d.amount))} · paid {eur(paid)}</div>
+                  </div>
+                  <div className={"amt mono " + (done ? "pos" : "neg")}>{done ? "Settled" : eur(rem)}</div>
+                </div>
+                {(d.payments || []).length > 0 && (
+                  <div style={{ marginTop: 8, paddingLeft: 8, borderLeft: "2px solid var(--line)" }}>
+                    {(d.payments || []).map((p) => (
+                      <div key={p.id} style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, color: "var(--ink2)", padding: "3px 0" }}>
+                        <span>{p.date || "—"}{p.desc ? " · " + p.desc : ""}</span>
+                        <span style={{ display: "flex", gap: 8 }}>
+                          <span className="mono">{eur(n(p.amount))}</span>
+                          <button className="removebtn" style={{ fontSize: 12 }} onClick={() => { if (window.confirm("Remove this payment?")) delPayment(d.id, p.id); }}>remove</button>
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {payFor === d.id ? (
+                  <div className="editbox" style={{ marginTop: 8 }}>
+                    <div className="er">
+                      <div><label>Date</label><input type="date" value={pay.date} onChange={(e) => setPay({ ...pay, date: e.target.value })} /></div>
+                      <div><label>Amount (€)</label><input type="number" inputMode="decimal" value={pay.amount} onChange={(e) => setPay({ ...pay, amount: e.target.value })} /></div>
+                    </div>
+                    <div className="er"><div><label>Note</label><input value={pay.desc} onChange={(e) => setPay({ ...pay, desc: e.target.value })} placeholder="optional" /></div></div>
+                    <div className="acts">
+                      <button className="cancel" onClick={() => { setPayFor(null); setPay({ date: "", amount: "", desc: "" }); }}>Cancel</button>
+                      <button className="save" onClick={() => addPayment(d.id)}>Save payment</button>
+                    </div>
+                  </div>
+                ) : (
+                  <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+                    {!done && <button className="add" style={{ padding: "8px", fontSize: 13 }} onClick={() => { setPayFor(d.id); setPay({ date: "", amount: "", desc: "" }); }}>Add payment</button>}
+                    <button className="removebtn" onClick={() => { if (window.confirm("Remove this whole debt and its payments?")) delDebt(d.id); }}>Remove debt</button>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* =========================== PERSONAL (people) ===========================
+   Private debts between anyone, unrelated to any company Kasse.
+   {id,date,from,to,amount,desc,payments:[]} — "from owes to". */
+function PersonalView({ data, set }) {
+  const { p1, p2 } = data.settings;
+  const savedPeople = data.people || [];
+  const nameOptions = Array.from(new Set([p1, p2, ...savedPeople]));
+
+  const [f, setF] = useState({ date: "", from: p1, fromNew: "", to: p2, toNew: "", amount: "", desc: "" });
+  const [payFor, setPayFor] = useState(null);
+  const [pay, setPay] = useState({ date: "", amount: "", desc: "" });
+
+  const rememberPeople = (names) => {
+    let list = data.people || [];
+    names.forEach((nm) => {
+      if (nm && nm !== p1 && nm !== p2 && !list.includes(nm)) list = [...list, nm];
+    });
+    return list;
+  };
+
+  const add = () => {
+    const from = f.from === "__new__" ? f.fromNew.trim() : f.from;
+    const to = f.to === "__new__" ? f.toNew.trim() : f.to;
+    if (!f.amount || !from || !to || from === to) return;
+    set({
+      ...data,
+      people: rememberPeople([from, to]),
+      personal: [{ id: uid(), date: f.date, from, to, amount: f.amount, desc: f.desc, payments: [] }, ...(data.personal || [])],
+    });
+    setF({ ...f, amount: "", desc: "", fromNew: "", toNew: "", date: "" });
+  };
+  const del = (id) => set({ ...data, personal: (data.personal || []).filter((x) => x.id !== id) });
+  const addPayment = (pid) => {
+    if (!pay.amount) return;
+    set({
+      ...data,
+      personal: (data.personal || []).map((d) =>
+        d.id === pid ? { ...d, payments: [{ id: uid(), ...pay }, ...(d.payments || [])] } : d
+      ),
+    });
+    setPay({ date: "", amount: "", desc: "" });
+    setPayFor(null);
+  };
+  const delPayment = (pid, payId) =>
+    set({
+      ...data,
+      personal: (data.personal || []).map((d) =>
+        d.id === pid ? { ...d, payments: (d.payments || []).filter((p) => p.id !== payId) } : d
+      ),
+    });
+
+  // net between the two partners specifically (informational)
+  let p1ToP2 = 0, p2ToP1 = 0;
+  (data.personal || []).forEach((d) => {
+    const rem = n(d.amount) - (d.payments || []).reduce((s, p) => s + n(p.amount), 0);
+    if (d.from === p1 && d.to === p2) p1ToP2 += rem;
+    else if (d.from === p2 && d.to === p1) p2ToP1 += rem;
+  });
+  const net = p2ToP1 - p1ToP2; // positive => p1 owes p2 net... keep simple below
+
+  return (
+    <div className="wrap">
+      <div className="card">
+        <div className="card-h"><h2>Personal debts</h2></div>
+        <div className="card-b">
+          <div className="note">
+            Private money between any people — not connected to the companies' Kasse.
+            "A owes B". Pay in parts; the remaining updates automatically.
+          </div>
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="card-h"><h2>Add a personal debt</h2></div>
+        <div className="card-b">
+          <div className="frow">
+            <div className="fld"><label>Who owes? (from)</label>
+              <select value={f.from} onChange={(e) => setF({ ...f, from: e.target.value })}>
+                {nameOptions.map((nm) => <option key={nm} value={nm}>{nm}</option>)}
+                <option value="__new__">+ New name…</option>
+              </select>
+            </div>
+            <div className="fld"><label>Owes who? (to)</label>
+              <select value={f.to} onChange={(e) => setF({ ...f, to: e.target.value })}>
+                {nameOptions.map((nm) => <option key={nm} value={nm}>{nm}</option>)}
+                <option value="__new__">+ New name…</option>
+              </select>
+            </div>
+          </div>
+          {f.from === "__new__" && <div className="fld"><label>New name (who owes)</label><input value={f.fromNew} onChange={(e) => setF({ ...f, fromNew: e.target.value })} /></div>}
+          {f.to === "__new__" && <div className="fld"><label>New name (owed to)</label><input value={f.toNew} onChange={(e) => setF({ ...f, toNew: e.target.value })} /></div>}
+          <div className="frow">
+            <div className="fld"><label>Date</label><input type="date" value={f.date} onChange={(e) => setF({ ...f, date: e.target.value })} /></div>
+            <div className="fld"><label>Amount (€)</label><input type="number" inputMode="decimal" value={f.amount} onChange={(e) => setF({ ...f, amount: e.target.value })} /></div>
+          </div>
+          <div className="fld"><label>Description</label><input value={f.desc} onChange={(e) => setF({ ...f, desc: e.target.value })} placeholder="what is this for?" /></div>
+          <button className="add" onClick={add}>Add personal debt</button>
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="card-h"><h2>Debts</h2></div>
+        <div className="card-b">
+          {(data.personal || []).length === 0 && <div className="empty">No entries yet.</div>}
+          {(data.personal || []).map((d) => {
+            const paid = (d.payments || []).reduce((s, p) => s + n(p.amount), 0);
+            const rem = n(d.amount) - paid;
+            const done = rem < 0.005;
+            return (
+              <div className="entry" key={d.id} style={{ display: "block", background: done ? "#eef5ee" : "#fff" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 }}>
+                  <div>
+                    <div className="desc">{d.from} owes {d.to}{d.desc ? " · " + d.desc : ""}</div>
+                    <div className="date">{d.date || "—"} · amount {eur(n(d.amount))} · paid {eur(paid)}</div>
+                  </div>
+                  <div className={"amt mono " + (done ? "pos" : "neg")}>{done ? "Settled" : eur(rem)}</div>
+                </div>
+                {(d.payments || []).length > 0 && (
+                  <div style={{ marginTop: 8, paddingLeft: 8, borderLeft: "2px solid var(--line)" }}>
+                    {(d.payments || []).map((p) => (
+                      <div key={p.id} style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, color: "var(--ink2)", padding: "3px 0" }}>
+                        <span>{p.date || "—"}{p.desc ? " · " + p.desc : ""}</span>
+                        <span style={{ display: "flex", gap: 8 }}>
+                          <span className="mono">{eur(n(p.amount))}</span>
+                          <button className="removebtn" style={{ fontSize: 12 }} onClick={() => { if (window.confirm("Remove this payment?")) delPayment(d.id, p.id); }}>remove</button>
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {payFor === d.id ? (
+                  <div className="editbox" style={{ marginTop: 8 }}>
+                    <div className="er">
+                      <div><label>Date</label><input type="date" value={pay.date} onChange={(e) => setPay({ ...pay, date: e.target.value })} /></div>
+                      <div><label>Amount (€)</label><input type="number" inputMode="decimal" value={pay.amount} onChange={(e) => setPay({ ...pay, amount: e.target.value })} /></div>
+                    </div>
+                    <div className="er"><div><label>Note</label><input value={pay.desc} onChange={(e) => setPay({ ...pay, desc: e.target.value })} placeholder="optional" /></div></div>
+                    <div className="acts">
+                      <button className="cancel" onClick={() => { setPayFor(null); setPay({ date: "", amount: "", desc: "" }); }}>Cancel</button>
+                      <button className="save" onClick={() => addPayment(d.id)}>Save payment</button>
+                    </div>
+                  </div>
+                ) : (
+                  <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+                    {!done && <button className="add" style={{ padding: "8px", fontSize: 13 }} onClick={() => { setPayFor(d.id); setPay({ date: "", amount: "", desc: "" }); }}>Add payment</button>}
+                    <button className="removebtn" onClick={() => { if (window.confirm("Remove this whole debt and its payments?")) del(d.id); }}>Remove debt</button>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Overview({ data }) {
+  const { p1, p2, share2 } = data.settings;
+
+  const ym = (dateStr) => {
+    if (!dateStr) return { y: "", m: "" };
+    const mm = String(dateStr).match(/^(\d{4})-(\d{2})/);
+    if (mm) return { y: mm[1], m: mm[2] };
+    return { y: "", m: "" };
+  };
+  const [oMonth, setOMonth] = useState("all");
+  const [oYear, setOYear] = useState("all");
+  const months = [
+    ["01", "January"], ["02", "February"], ["03", "March"], ["04", "April"],
+    ["05", "May"], ["06", "June"], ["07", "July"], ["08", "August"],
+    ["09", "September"], ["10", "October"], ["11", "November"], ["12", "December"],
+  ];
+  const yearsSet = new Set();
+  Object.keys(data.companies).forEach((k) => {
+    (data.companies[k].moves || []).forEach((m) => { const { y } = ym(m.date); if (y) yearsSet.add(y); });
+  });
+  const years = Array.from(yearsSet).sort().reverse();
+  const inPeriod = (dateStr) => {
+    const { y, m } = ym(dateStr);
+    if (oMonth !== "all" && m !== oMonth) return false;
+    if (oYear !== "all" && y !== oYear) return false;
+    return true;
+  };
+  const periodActive = oMonth !== "all" || oYear !== "all";
+
+  let totKasse = 0, totBalP1 = 0, totBalP2 = 0;
+  let periodIncome = 0, periodExpense = 0;
+  const rows = Object.keys(data.companies).map((k) => {
+    const co = data.companies[k];
+    if (k === "re") {
+      const r = calcRE(co);
+      totBalP2 += r.balP2;
+      return { name: co.name, isRE: true, balP2: r.balP2, paid: r.paidByP2, sent: r.sentToP2, pIn: 0, pOut: 0 };
+    }
+    const c = calcCompany(co, share2, p1, p2, data.debts, k);
+    totKasse += c.kasse; totBalP1 += c.balP1; totBalP2 += c.balP2;
+    // per-company income/expense for the selected period
+    let pIn = 0, pOut = 0;
+    (co.moves || []).forEach((m) => {
+      if (!inPeriod(m.date)) return;
+      if (m.type === "in") pIn += n(m.amount); else pOut += n(m.amount);
+    });
+    periodIncome += pIn; periodExpense += pOut;
+    return { name: co.name, isRE: false, pIn, pOut, ...c };
+  });
+  const balCls = (v) => (v > 0 ? "pos" : v < 0 ? "neg" : "");
+  // debt totals from the new model
+  let coOwesTotal = 0, owesCoTotal = 0;
+  (data.debts || []).forEach((d) => {
+    const rem = n(d.amount) - (d.payments || []).reduce((s, p) => s + n(p.amount), 0);
+    if (d.dir === "coOwes") coOwesTotal += rem; else owesCoTotal += rem;
+  });
+  let personalOpen = 0;
+  (data.personal || []).forEach((d) => {
+    personalOpen += n(d.amount) - (d.payments || []).reduce((s, p) => s + n(p.amount), 0);
+  });
+  return (
+    <div className="wrap">
+      <div className="card">
+        <div className="card-b">
+          <div className="kasse">
+            <div className="lbl">Total cash (all companies)</div>
+            <div className={"big mono " + (totKasse >= 0 ? "" : "neg")}>{eur(totKasse)}</div>
+          </div>
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="card-h"><h2>Monthly totals (all companies)</h2></div>
+        <div className="card-b">
+          <div className="frow">
+            <div className="fld"><label>Month</label>
+              <select value={oMonth} onChange={(e) => setOMonth(e.target.value)}>
+                <option value="all">All months</option>
+                {months.map(([v, nm]) => <option key={v} value={v}>{nm}</option>)}
+              </select>
+            </div>
+            <div className="fld"><label>Year</label>
+              <select value={oYear} onChange={(e) => setOYear(e.target.value)}>
+                <option value="all">All years</option>
+                {years.map((y) => <option key={y} value={y}>{y}</option>)}
+              </select>
+            </div>
+          </div>
+          <div className="tiles" style={{ marginBottom: 0 }}>
+            <div className="tile"><div className="tl">Income{periodActive ? " (period)" : " (all)"}</div><div className="tv pos mono">{eur(periodIncome)}</div></div>
+            <div className="tile"><div className="tl">Expense{periodActive ? " (period)" : " (all)"}</div><div className="tv neg mono">{eur(periodExpense)}</div></div>
+          </div>
+          <div style={{ marginTop: 10 }}>
+            {rows.filter((r) => !r.isRE).map((r, i) => (
+              <div className="kpi" key={i}>
+                <span className="lab">{r.name}</span>
+                <span className="val mono"><span className="pos">{eur(r.pIn)}</span> · <span className="neg">{eur(r.pOut)}</span></span>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+      <div className="card">
+        <div className="card-h"><h2>Total balances</h2></div>
+        <div className="card-b">
+          <div className={"bal " + (Math.abs(totBalP1) < 0.005 ? "z" : totBalP1 > 0 ? "p" : "n")}>
+            <div><div className="who">{p1}</div><div className="st">{Math.abs(totBalP1) < 0.005 ? "Settled" : totBalP1 > 0 ? "Took extra (+)" : "Still owed (−)"}</div></div>
+            <div className={"amt mono " + balCls(totBalP1)}>{eur(totBalP1)}</div>
+          </div>
+          <div className={"bal " + (Math.abs(totBalP2) < 0.005 ? "z" : totBalP2 > 0 ? "p" : "n")} style={{ marginTop: 8 }}>
+            <div><div className="who">{p2}</div><div className="st">{Math.abs(totBalP2) < 0.005 ? "Settled" : totBalP2 > 0 ? "Took extra (+)" : "Still owed (−)"}</div></div>
+            <div className={"amt mono " + balCls(totBalP2)}>{eur(totBalP2)}</div>
+          </div>
+        </div>
+      </div>
+      <div className="card">
+        <div className="card-h"><h2>Per company</h2></div>
+        <div className="card-b">
+          {rows.map((r, i) => (
+            <div className="kpi" key={i}>
+              <span className="lab">{r.name}</span>
+              {r.isRE ? (
+                <span className={"val mono " + balCls(r.balP2)}>
+                  {Math.abs(r.balP2) < 0.005 ? "Settled" : eur(r.balP2)}
+                </span>
+              ) : (
+                <span className="val mono">Kasse {eur(r.kasse)}</span>
+              )}
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="card-h"><h2>Open debts</h2></div>
+        <div className="card-b">
+          <div className="kpi">
+            <span className="lab">Companies owe others</span>
+            <span className={"val mono " + (coOwesTotal > 0.005 ? "neg" : "")}>
+              {coOwesTotal > 0.005 ? eur(coOwesTotal) : "None"}
+            </span>
+          </div>
+          <div className="kpi">
+            <span className="lab">Others owe the companies</span>
+            <span className={"val mono " + (owesCoTotal > 0.005 ? "pos" : "")}>
+              {owesCoTotal > 0.005 ? eur(owesCoTotal) : "None"}
+            </span>
+          </div>
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="card-h"><h2>Personal debts (open)</h2></div>
+        <div className="card-b">
+          <div className="kpi">
+            <span className="lab">Total still open</span>
+            <span className={"val mono " + (personalOpen > 0.005 ? "neg" : "")}>
+              {personalOpen > 0.005 ? eur(personalOpen) : "None"}
+            </span>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Settings({ data, set }) {
+  const s = data.settings;
+  const { p1, p2 } = s;
+  const upd = (k, v) => set({ ...data, settings: { ...s, [k]: v } });
+  const updName = (ck, v) =>
+    set({ ...data, companies: { ...data.companies, [ck]: { ...data.companies[ck], name: v } } });
+
+  const [exportView, setExportView] = useState(null); // {title, text} shown in-app
+
+  const download = (content, filename, type) => {
+    // Try a normal download (works in real browsers)
+    try {
+      const blob = new Blob([content], { type });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = filename; a.click();
+      URL.revokeObjectURL(url);
+    } catch (e) {}
+  };
+
+  const exportData = () => {
+    const text = JSON.stringify(data, null, 2);
+    download(text, "partnership-backup.json", "application/json");
+    setExportView({ title: "Backup (JSON)", text, hint: "This is your full backup. Copy it and save it somewhere safe (email it to yourself, save in Notes). To restore later, use \u201cRestore from a file\u201d or paste it back." });
+  };
+
+  const csvCell = (v) => {
+    const str = String(v == null ? "" : v);
+    return /[",\n]/.test(str) ? '"' + str.replace(/"/g, '""') + '"' : str;
+  };
+  const buildCSV = () => {
+    const rows = [["Company", "Type", "Date", "Amount (EUR)", "Who", "Description"]];
+    Object.keys(data.companies).forEach((ck) => {
+      const co = data.companies[ck];
+      (co.moves || []).forEach((m) =>
+        rows.push([co.name, m.type === "in" ? "Income" : "Expense", m.date || "", n(m.amount), "", m.desc || ""]));
+      (co.draws || []).forEach((d) =>
+        rows.push([co.name, "Withdrawal", d.date || "", n(d.amount), d.who || "", d.desc || ""]));
+    });
+    (data.debts || []).forEach((d) => {
+      const coNm = data.companies[d.co] ? data.companies[d.co].name : d.co;
+      rows.push([coNm, d.dir === "coOwes" ? "Debt (company owes)" : "Debt (owed to company)", d.date || "", n(d.amount), d.person || "", d.desc || ""]);
+      (d.payments || []).forEach((p) =>
+        rows.push([coNm, "Debt payment", p.date || "", n(p.amount), d.person || "", p.desc || ""]));
+    });
+    (data.personal || []).forEach((d) => {
+      rows.push(["Personal", "Personal debt", d.date || "", n(d.amount), d.from + " \u2192 " + d.to, d.desc || ""]);
+      (d.payments || []).forEach((p) =>
+        rows.push(["Personal", "Personal payment", p.date || "", n(p.amount), d.from + " \u2192 " + d.to, p.desc || ""]));
+    });
+    return rows.map((r) => r.map(csvCell).join(",")).join("\n");
+  };
+  const exportCSV = () => {
+    const csv = buildCSV();
+    download("\uFEFF" + csv, "partnership-report.csv", "text/csv;charset=utf-8");
+    setExportView({ title: "Excel / CSV data", text: csv, hint: "Copy everything below, open Excel or Google Sheets, and paste. It will fill the columns automatically. (On the app, a file download may be blocked, so copying is the reliable way.)" });
+  };
+
+  const exportPDF = () => {
+    const rowsHtml = [];
+    Object.keys(data.companies).forEach((ck) => {
+      const co = data.companies[ck];
+      const all = [
+        ...(co.moves || []).map((m) => ({ t: m.type === "in" ? "Income" : "Expense", date: m.date, amount: n(m.amount), who: "", desc: m.desc, sign: m.type === "in" ? "+" : "\u2212" })),
+        ...(co.draws || []).map((d) => ({ t: "Withdrawal", date: d.date, amount: n(d.amount), who: d.who, desc: d.desc, sign: "\u2212" })),
+      ].sort((a, b) => String(b.date).localeCompare(String(a.date)));
+      if (all.length === 0) return;
+      rowsHtml.push('<h2>' + co.name + '</h2><table><tr><th>Date</th><th>Type</th><th>Who</th><th>Description</th><th style="text-align:right">Amount</th></tr>' +
+        all.map((r) => '<tr><td>' + (r.date || "") + '</td><td>' + r.t + '</td><td>' + (r.who || "") + '</td><td>' + (r.desc || "") + '</td><td style="text-align:right">' + r.sign + "\u20ac" + r.amount.toLocaleString("en-US", { minimumFractionDigits: 2 }) + '</td></tr>').join("") +
+        '</table>');
+    });
+    const html = '<html><head><title>Partnership Report</title><style>' +
+      'body{font-family:Arial,sans-serif;padding:24px;color:#13233b}h1{font-size:20px}h2{font-size:15px;margin-top:22px;border-bottom:2px solid #b08322;padding-bottom:4px}' +
+      'table{width:100%;border-collapse:collapse;font-size:12px;margin-top:6px}th,td{border-bottom:1px solid #ddd;padding:6px 8px;text-align:left}th{background:#f4f1ea}' +
+      '</style></head><body><h1>Partnership Report \u2014 ' + new Date().toLocaleDateString() + '</h1>' + rowsHtml.join("") +
+      '<p style="margin-top:24px;color:#888;font-size:11px">Generated from Partnership Ledger</p></body></html>';
+    // Try opening a print window; if blocked (WebView), fall back to writing into this document.
+    let win = null;
+    try { win = window.open("", "_blank"); } catch (e) {}
+    if (win) {
+      win.document.write(html);
+      win.document.close();
+      setTimeout(() => { try { win.print(); } catch (e) {} }, 400);
+    } else {
+      const iframe = document.createElement("iframe");
+      iframe.style.position = "fixed"; iframe.style.right = "0"; iframe.style.bottom = "0";
+      iframe.style.width = "0"; iframe.style.height = "0"; iframe.style.border = "0";
+      document.body.appendChild(iframe);
+      const doc = iframe.contentWindow.document;
+      doc.open(); doc.write(html); doc.close();
+      setTimeout(() => { try { iframe.contentWindow.focus(); iframe.contentWindow.print(); } catch (e) {} }, 500);
+    }
+  };
+
+  const importData = (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const parsed = JSON.parse(reader.result);
+        if (!parsed.companies || !parsed.settings) { alert("This doesn't look like a valid backup file."); return; }
+        if (window.confirm("Replace ALL current data with this backup? Your current data will be overwritten.")) {
+          set(mergeDefaults(parsed));
+        }
+      } catch (err) { alert("Could not read this file."); }
+    };
+    reader.readAsText(file);
+    e.target.value = "";
+  };
+
+  const [showBackups, setShowBackups] = useState(false);
+  const [pasteMode, setPasteMode] = useState(false);
+  const [pasteText, setPasteText] = useState("");
+  const backups = loadBackups();
+  const copyText = (t) => {
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(t);
+        alert("Copied!");
+        return;
+      }
+    } catch (e) {}
+    alert("Select the text and copy it manually.");
+  };
+  const restoreFromPaste = () => {
+    try {
+      const parsed = JSON.parse(pasteText);
+      if (!parsed.companies || !parsed.settings) { alert("This doesn't look like a valid backup."); return; }
+      if (window.confirm("Replace ALL current data with this backup?")) {
+        set(mergeDefaults(parsed));
+        setPasteMode(false); setPasteText("");
+      }
+    } catch (e) { alert("Could not read this text. Make sure you pasted the full backup."); }
+  };
+  const restoreBackup = (snapshot) => {
+    try {
+      const parsed = JSON.parse(snapshot);
+      if (window.confirm("Restore this backup? Current data will be replaced.")) set(mergeDefaults(parsed));
+    } catch (e) { alert("Could not restore this backup."); }
+  };
+
+  return (
+    <div className="wrap">
+      <div className="card">
+        <div className="card-h"><h2>Names & share</h2></div>
+        <div className="card-b">
+          <div className="set-row"><label>Partner 1 (80%)</label><input value={s.p1} onChange={(e) => upd("p1", e.target.value)} /></div>
+          <div className="set-row"><label>Partner 2 (20%)</label><input value={s.p2} onChange={(e) => upd("p2", e.target.value)} /></div>
+          <div className="set-row"><label>Partner 2 share</label><input type="number" step="0.01" value={s.share2} onChange={(e) => upd("share2", n(e.target.value))} /></div>
+        </div>
+      </div>
+      <div className="card">
+        <div className="card-h"><h2>Company names</h2></div>
+        <div className="card-b">
+          {Object.keys(data.companies).map((ck) => (
+            <div className="set-row" key={ck}><label>{ck}</label><input value={data.companies[ck].name} onChange={(e) => updName(ck, e.target.value)} /></div>
+          ))}
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="card-h"><h2>Export & reports</h2></div>
+        <div className="card-b">
+          <button className="big-btn" onClick={exportCSV}>Export as Excel (CSV)</button>
+          <button className="big-btn" style={{ marginTop: 8, background: "var(--brass)" }} onClick={exportPDF}>Export as PDF (print)</button>
+          <button className="big-btn" style={{ marginTop: 8, background: "var(--ink2)" }} onClick={exportData}>Export backup (JSON)</button>
+          <div className="note">On the app, file downloads may be blocked — so each export also shows the data on screen to copy. PDF opens a printable report.</div>
+
+          {exportView && (
+            <div className="editbox" style={{ marginTop: 12 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                <strong style={{ fontSize: 14 }}>{exportView.title}</strong>
+                <button className="removebtn" onClick={() => setExportView(null)}>Close</button>
+              </div>
+              <div className="note" style={{ marginTop: 0, marginBottom: 8 }}>{exportView.hint}</div>
+              <textarea readOnly value={exportView.text} onFocus={(e) => e.target.select()}
+                style={{ width: "100%", height: 160, fontSize: 12, fontFamily: "monospace", border: "1.5px solid var(--line)", borderRadius: 8, padding: 8, boxSizing: "border-box" }} />
+              <button className="add" style={{ marginTop: 8 }} onClick={() => copyText(exportView.text)}>Copy to clipboard</button>
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="card-h"><h2>Restore & auto-backup</h2></div>
+        <div className="card-b">
+          <label className="big-btn" style={{ display: "block", textAlign: "center", background: "var(--ink)", cursor: "pointer" }}>
+            Restore from a file
+            <input type="file" accept="application/json,.json" onChange={importData} style={{ display: "none" }} />
+          </label>
+          <button className="big-btn" style={{ marginTop: 8, background: "var(--ink)" }} onClick={() => setPasteMode(!pasteMode)}>
+            {pasteMode ? "Cancel paste" : "Restore by pasting text"}
+          </button>
+          {pasteMode && (
+            <div className="editbox" style={{ marginTop: 10 }}>
+              <div className="note" style={{ marginTop: 0 }}>Paste a JSON backup you copied earlier, then press Restore.</div>
+              <textarea value={pasteText} onChange={(e) => setPasteText(e.target.value)} placeholder="paste backup here…"
+                style={{ width: "100%", height: 120, fontSize: 12, fontFamily: "monospace", border: "1.5px solid var(--line)", borderRadius: 8, padding: 8, boxSizing: "border-box" }} />
+              <button className="add" style={{ marginTop: 8 }} onClick={restoreFromPaste}>Restore from pasted text</button>
+            </div>
+          )}
+          <button className="big-btn" style={{ marginTop: 8, background: "var(--paper)", color: "var(--ink)", border: "1.5px solid var(--line)" }} onClick={() => setShowBackups(!showBackups)}>
+            {showBackups ? "Hide" : "Show"} automatic backups ({backups.length})
+          </button>
+          {showBackups && (
+            <div style={{ marginTop: 10 }}>
+              {backups.length === 0 && <div className="empty">No automatic backups yet.</div>}
+              {backups.map((b, i) => (
+                <div className="entry" key={i}>
+                  <div><div className="desc">Backup {i + 1}</div><div className="date">{new Date(b.at).toLocaleString()}</div></div>
+                  <button className="editbtn" onClick={() => restoreBackup(b.snapshot)}>Restore</button>
+                </div>
+              ))}
+            </div>
+          )}
+          <div className="note">The app keeps the last {MAX_BACKUPS} versions automatically on this device. Export a JSON backup regularly and save it off-device (email/Notes).</div>
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="card-h"><h2>Security</h2></div>
+        <div className="card-b">
+          <button className="big-btn" style={{ background: "var(--neg)" }} onClick={() => { try { localStorage.removeItem(AUTH_KEY); } catch (e) {} window.location.reload(); }}>Log out</button>
+          <div className="note">You'll need the password to open the app again on this device.</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* -------------------------------- Root ---------------------------------- */
+const APP_PASSWORD = "Ahmed2030";
+const AUTH_KEY = "partnership_auth_v1";
+
+function LockScreen({ onOk }) {
+  const [pw, setPw] = React.useState("");
+  const [err, setErr] = React.useState(false);
+  const submit = () => {
+    if (pw === APP_PASSWORD) {
+      try { localStorage.setItem(AUTH_KEY, "1"); } catch (e) {}
+      onOk();
+    } else {
+      setErr(true);
+    }
+  };
+  return (
+    <>
+      <style>{css}</style>
+      <div className="app">
+        <div className="top">
+          <h1>Partnership Ledger</h1>
+          <p>Enter password to continue</p>
+        </div>
+        <div className="wrap">
+          <div className="card">
+            <div className="card-b">
+              <div className="fld">
+                <label>Password</label>
+                <input
+                  type="password"
+                  value={pw}
+                  autoFocus
+                  onChange={(e) => { setPw(e.target.value); setErr(false); }}
+                  onKeyDown={(e) => { if (e.key === "Enter") submit(); }}
+                  placeholder="••••••••"
+                />
+              </div>
+              {err && <div className="note" style={{ color: "var(--neg)" }}>Wrong password. Try again.</div>}
+              <button className="add" onClick={submit}>Unlock</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </>
+  );
+}
+
+function App() {
+  const [authed, setAuthed] = useState(() => {
+    try { return localStorage.getItem(AUTH_KEY) === "1"; } catch (e) { return false; }
+  });
+  const [data, setData] = useState(null);
+  const [tab, setTab] = useState("overview");
+  const [saved, setSaved] = useState(false);
+
+  useEffect(() => { if (authed) loadAll().then(setData); }, [authed]);
+  const set = (d) => { setData(d); saveAll(d).then(() => { setSaved(true); setTimeout(() => setSaved(false), 700); }); };
+
+  if (!authed) return <LockScreen onOk={() => setAuthed(true)} />;
+  if (!data) return <div style={{ padding: 40, textAlign: "center", color: "#7b8494" }}>Loading…</div>;
+
+  const tabs = [
+    ["overview", "Overview"],
+    ...Object.keys(data.companies).map((k) => [k, data.companies[k].name]),
+    ["debts", "Debts"],
+    ["personal", "Personal"],
+    ["settings", "Settings"],
+  ];
+
+  return (
+    <>
+      <style>{css}</style>
+      <div className="app">
+        <div className="top">
+          <h1>Partnership Ledger</h1>
+          <p>{data.settings.p1} 80% · {data.settings.p2} 20%</p>
+          <div className="sync"><span className={"dot" + (saved ? " on" : "")} />{saved ? "Saved" : SYNC_ON ? "Synced" : "Local"}</div>
+        </div>
+        <div className="tabs">
+          {tabs.map(([id, label]) => (
+            <button key={id} className={"tab" + (tab === id ? " active" : "")} onClick={() => setTab(id)}>{label}</button>
+          ))}
+        </div>
+        {tab === "overview" && <Overview data={data} />}
+        {tab === "settings" && <Settings data={data} set={set} />}
+        {tab === "debts" && <DebtsView data={data} set={set} />}
+        {tab === "personal" && <PersonalView data={data} set={set} />}
+        {tab === "re" && <RealEstateView data={data} set={set} />}
+        {data.companies[tab] && tab !== "re" && <CompanyView ckey={tab} data={data} set={set} />}
+      </div>
+    </>
+  );
+}
+
+
+
+
+
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<App />);
+</script>
+</body>
+</html>
+
+{
+  "name": "Partnership Ledger",
+  "short_name": "Partnership",
+  "description": "Private partnership accounting for Mohamed and Ahmed",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#f4f1ea",
+  "theme_color": "#13233b",
+  "icons": [
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ]
+}
+
+// Minimal service worker so the app is installable as a PWA / APK.
+const CACHE = "partnership-v1";
+self.addEventListener("install", (e) => { self.skipWaiting(); });
+self.addEventListener("activate", (e) => { self.clients.claim(); });
+self.addEventListener("fetch", (e) => {
+  // Network-first so data always stays fresh; fall back to cache if offline.
+  e.respondWith(
+    fetch(e.request).then((res) => {
+      const copy = res.clone();
+      caches.open(CACHE).then((c) => { try { c.put(e.request, copy); } catch (err) {} });
+      return res;
+    }).catch(() => caches.match(e.request))
+  );
+});
