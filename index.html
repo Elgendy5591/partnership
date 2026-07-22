@@ -98,6 +98,7 @@ function mergeDefaults(d) {
 
 async function saveAll(data) {
   try { localStorage.setItem(STORAGE_KEY, JSON.stringify(data)); } catch (e) {}
+  pushBackup(data);
   if (SYNC_ON) {
     try {
       await fetch(SUPABASE_URL + "/rest/v1/app_state?on_conflict=key", {
@@ -115,10 +116,37 @@ async function saveAll(data) {
 }
 
 const uid = () => Math.random().toString(36).slice(2, 10);
+
+// ---- rolling local backups: keep the last N snapshots automatically ----
+const BACKUP_KEY = "partnership_backups_v1";
+const MAX_BACKUPS = 10;
+function loadBackups() {
+  try { return JSON.parse(localStorage.getItem(BACKUP_KEY) || "[]"); } catch (e) { return []; }
+}
+function pushBackup(data) {
+  try {
+    const list = loadBackups();
+    const last = list[0];
+    const snapshot = JSON.stringify(data);
+    // skip if identical to the most recent snapshot
+    if (last && last.snapshot === snapshot) return;
+    list.unshift({ at: new Date().toISOString(), snapshot });
+    localStorage.setItem(BACKUP_KEY, JSON.stringify(list.slice(0, MAX_BACKUPS)));
+  } catch (e) {}
+}
+
 const n = (v) => (isNaN(parseFloat(v)) ? 0 : parseFloat(v));
 const eur = (v) =>
   (v < 0 ? "-" : "") + "€" +
   Math.abs(v).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+// Show a date, plus time if the stored value includes one (datetime-local: YYYY-MM-DDTHH:MM)
+const fmtDate = (s) => {
+  if (!s) return "—";
+  const t = String(s).match(/^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2})/);
+  if (t) return t[1] + " · " + t[2];
+  return String(s);
+};
 
 /* ------------------------------- Styles --------------------------------- */
 const css = `
@@ -190,6 +218,17 @@ body{background:var(--paper);color:var(--ink);
 .seg{display:flex;gap:6px;margin-bottom:11px}
 .seg button{flex:1;border:1.5px solid var(--line);background:#fff;color:var(--ink2);padding:9px;border-radius:9px;font-size:13px;font-weight:700;cursor:pointer}
 .seg button.on{background:var(--ink);color:#fff;border-color:var(--ink)}
+.seg3 button{padding:9px 4px;font-size:12.5px}
+.seg button.onIn{background:#1c9e63;border-color:#1c9e63;color:#fff}
+.seg button.onOut{background:#e0524a;border-color:#e0524a;color:#fff}
+.seg button.onDraw{background:#9a5bd6;border-color:#9a5bd6;color:#fff}
+.add.btnIn{background:#1c9e63}
+.add.btnOut{background:#e0524a}
+.add.btnDraw{background:#9a5bd6}
+.tiles{display:grid;grid-template-columns:1fr 1fr;gap:9px;margin-bottom:12px}
+.tile{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:13px 14px;box-shadow:0 1px 2px rgba(20,30,50,.04)}
+.tile .tl{font-size:12px;color:var(--ink2);font-weight:600;margin-bottom:6px}
+.tile .tv{font-size:19px;font-weight:800}
 .fld{margin-bottom:10px}
 .fld label{display:block;font-size:12px;font-weight:600;color:var(--ink2);margin-bottom:5px}
 .fld input,.fld select{width:100%;border:1.5px solid var(--line);border-radius:10px;padding:11px 12px;font-size:15px;background:#fff;color:var(--ink);outline:none}
@@ -230,7 +269,7 @@ function EditRow({ entry, fields, view, onSave, onDelete, rowStyle, extraButtons
                   </select>
                 ) : (
                   <input
-                    type={f.type === "number" ? "number" : f.type === "date" ? "date" : "text"}
+                    type={f.type === "number" ? "number" : f.type === "date" ? "date" : f.type === "datetime" ? "datetime-local" : "text"}
                     inputMode={f.type === "number" ? "decimal" : undefined}
                     value={form[f.key] ?? ""}
                     onChange={(e) => setForm({ ...form, [f.key]: e.target.value })}
@@ -312,9 +351,69 @@ function CompanyView({ ckey, data, set }) {
   const { p1, p2, share2 } = data.settings;
   const c = calcCompany(co, share2, p1, p2, data.debts, ckey);
 
-  const [mode, setMode] = useState("in"); // in | out
+  // ---- unified list of entries (income / expense / draw) ----
+  const entries = [
+    ...co.moves.map((m) => ({ ...m, kind: m.type })),          // kind: 'in' | 'out'
+    ...co.draws.map((d) => ({ ...d, kind: "draw" })),
+  ];
+
+  // ---- filter state ----
+  const now = new Date();
+  const [fMonth, setFMonth] = useState("all");   // 'all' or '01'..'12'
+  const [fYear, setFYear] = useState("all");     // 'all' or e.g. '2026'
+  const [fType, setFType] = useState("all");     // 'all' | 'in' | 'out' | 'draw'
+  const [fSearch, setFSearch] = useState("");
+
+  const ym = (dateStr) => {
+    if (!dateStr) return { y: "", m: "" };
+    // Trust an explicit YYYY-MM prefix (avoids timezone shifting the month)
+    const mm = String(dateStr).match(/^(\d{4})-(\d{2})/);
+    if (mm) return { y: mm[1], m: mm[2] };
+    const d = new Date(dateStr);
+    if (isNaN(d)) return { y: "", m: "" };
+    return { y: String(d.getFullYear()), m: String(d.getMonth() + 1).padStart(2, "0") };
+  };
+
+  // available years from data
+  const yearsSet = new Set();
+  entries.forEach((e) => { const { y } = ym(e.date); if (y) yearsSet.add(y); });
+  const years = Array.from(yearsSet).sort().reverse();
+
+  const months = [
+    ["01", "January"], ["02", "February"], ["03", "March"], ["04", "April"],
+    ["05", "May"], ["06", "June"], ["07", "July"], ["08", "August"],
+    ["09", "September"], ["10", "October"], ["11", "November"], ["12", "December"],
+  ];
+
+  const passFilter = (e) => {
+    const { y, m } = ym(e.date);
+    if (fMonth !== "all" && m !== fMonth) return false;
+    if (fYear !== "all" && y !== fYear) return false;
+    if (fType !== "all" && e.kind !== fType) return false;
+    if (fSearch.trim()) {
+      const q = fSearch.trim().toLowerCase();
+      const hay = ((e.desc || "") + " " + (e.who || "")).toLowerCase();
+      if (hay.indexOf(q) === -1) return false;
+    }
+    return true;
+  };
+
+  const filtered = entries.filter(passFilter).sort((a, b) => String(b.date).localeCompare(String(a.date)));
+
+  // filtered totals (for the tiles)
+  let fIncome = 0, fExpense = 0, fDraw = 0;
+  filtered.forEach((e) => {
+    if (e.kind === "in") fIncome += n(e.amount);
+    else if (e.kind === "out") fExpense += n(e.amount);
+    else if (e.kind === "draw") fDraw += n(e.amount);
+  });
+  const filterActive = fMonth !== "all" || fYear !== "all" || fType !== "all" || fSearch.trim() !== "";
+  const resetFilter = () => { setFMonth("all"); setFYear("all"); setFType("all"); setFSearch(""); };
+
+  // ---- add forms ----
+  const [mode, setMode] = useState("in"); // in | out | draw
   const [mv, setMv] = useState({ date: "", desc: "", amount: "" });
-  const [dw, setDw] = useState({ date: "", who: p1, amount: "" });
+  const [dw, setDw] = useState({ date: "", who: p1, amount: "", desc: "" });
 
   const addMove = () => {
     if (!mv.amount) return;
@@ -326,7 +425,7 @@ function CompanyView({ ckey, data, set }) {
     if (!dw.amount) return;
     const co2 = { ...co, draws: [{ id: uid(), ...dw }, ...co.draws] };
     set({ ...data, companies: { ...data.companies, [ckey]: co2 } });
-    setDw({ date: "", who: p1, amount: "" });
+    setDw({ date: "", who: p1, amount: "", desc: "" });
   };
   const delMove = (id) =>
     set({ ...data, companies: { ...data.companies, [ckey]: { ...co, moves: co.moves.filter((m) => m.id !== id) } } });
@@ -341,20 +440,70 @@ function CompanyView({ ckey, data, set }) {
   const balState = (v) =>
     Math.abs(v) < 0.005 ? "Settled" : v > 0 ? "Took extra (+)" : "Still owed (−)";
 
+  const kindLabel = (k) => (k === "in" ? "Income" : k === "out" ? "Expense" : "Withdrawal");
+
   return (
     <div className="wrap">
-      {/* Kasse */}
+      {/* Total balance (always cumulative, never changes with filter) */}
       <div className="card">
         <div className="card-b">
           <div className="kasse">
-            <div className="lbl">Kasse (cash in hand)</div>
+            <div className="lbl">Total balance (Kasse) — all time</div>
             <div className={"big mono " + (c.kasse >= 0 ? "" : "neg")}>{eur(c.kasse)}</div>
           </div>
-          <div className="split">
-            <div className="col"><div className="t">Einnahmen</div><div className="v pos mono">{eur(c.income)}</div></div>
-            <div className="col"><div className="t">Ausgaben</div><div className="v neg mono">{eur(c.expense)}</div></div>
-            <div className="col"><div className="t">Net</div><div className="v mono">{eur(c.net)}</div></div>
+        </div>
+      </div>
+
+      {/* Summary tiles (respect the filter) */}
+      <div className="tiles">
+        <div className="tile">
+          <div className="tl">{filterActive ? "Income (filtered)" : "Income (all)"}</div>
+          <div className="tv pos mono">{eur(fIncome)}</div>
+        </div>
+        <div className="tile">
+          <div className="tl">{filterActive ? "Expense (filtered)" : "Expense (all)"}</div>
+          <div className="tv neg mono">{eur(fExpense)}</div>
+        </div>
+        <div className="tile">
+          <div className="tl">Withdrawals</div>
+          <div className="tv mono" style={{ color: "#9a5bd6" }}>{eur(fDraw)}</div>
+        </div>
+        <div className="tile">
+          <div className="tl">Entries</div>
+          <div className="tv mono">{filtered.length}</div>
+        </div>
+      </div>
+
+      {/* Filter */}
+      <div className="card">
+        <div className="card-h"><h2>Filter</h2></div>
+        <div className="card-b">
+          <div className="frow">
+            <div className="fld"><label>Month</label>
+              <select value={fMonth} onChange={(e) => setFMonth(e.target.value)}>
+                <option value="all">All months</option>
+                {months.map(([v, nm]) => <option key={v} value={v}>{nm}</option>)}
+              </select>
+            </div>
+            <div className="fld"><label>Year</label>
+              <select value={fYear} onChange={(e) => setFYear(e.target.value)}>
+                <option value="all">All years</option>
+                {years.map((y) => <option key={y} value={y}>{y}</option>)}
+              </select>
+            </div>
           </div>
+          <div className="fld"><label>Type</label>
+            <select value={fType} onChange={(e) => setFType(e.target.value)}>
+              <option value="all">All types</option>
+              <option value="in">Income only</option>
+              <option value="out">Expense only</option>
+              <option value="draw">Withdrawals only</option>
+            </select>
+          </div>
+          <div className="fld"><label>Search description / name</label>
+            <input value={fSearch} onChange={(e) => setFSearch(e.target.value)} placeholder="type to search…" />
+          </div>
+          {filterActive && <button className="add" style={{ background: "var(--paper)", color: "var(--ink2)", border: "1.5px solid var(--line)" }} onClick={resetFilter}>Reset filter</button>}
         </div>
       </div>
 
@@ -374,86 +523,92 @@ function CompanyView({ ckey, data, set }) {
         </div>
       </div>
 
-      {/* Add income / expense */}
+      {/* Add entry */}
       <div className="card">
-        <div className="card-h"><h2>Add income / expense</h2></div>
+        <div className="card-h"><h2>Add entry</h2></div>
         <div className="card-b">
-          <div className="seg">
-            <button className={mode === "in" ? "on" : ""} onClick={() => setMode("in")}>Einnahme (income)</button>
-            <button className={mode === "out" ? "on" : ""} onClick={() => setMode("out")}>Ausgabe (expense)</button>
+          <div className="seg seg3">
+            <button className={mode === "in" ? "on onIn" : ""} onClick={() => setMode("in")}>+ Income</button>
+            <button className={mode === "out" ? "on onOut" : ""} onClick={() => setMode("out")}>− Expense</button>
+            <button className={mode === "draw" ? "on onDraw" : ""} onClick={() => setMode("draw")}>Withdrawal</button>
           </div>
-          <div className="frow">
-            <div className="fld"><label>Date</label><input type="date" value={mv.date} onChange={(e) => setMv({ ...mv, date: e.target.value })} /></div>
-            <div className="fld"><label>Amount (€)</label><input type="number" inputMode="decimal" value={mv.amount} onChange={(e) => setMv({ ...mv, amount: e.target.value })} /></div>
-          </div>
-          <div className="fld"><label>Description</label><input value={mv.desc} onChange={(e) => setMv({ ...mv, desc: e.target.value })} placeholder="optional" /></div>
-          <button className="add" onClick={addMove}>Add {mode === "in" ? "income" : "expense"}</button>
-        </div>
-      </div>
 
-      {/* Record a withdrawal */}
-      <div className="card">
-        <div className="card-h"><h2>Money taken by a partner</h2></div>
-        <div className="card-b">
-          <div className="frow">
-            <div className="fld"><label>Date</label><input type="date" value={dw.date} onChange={(e) => setDw({ ...dw, date: e.target.value })} /></div>
-            <div className="fld"><label>Amount (€)</label><input type="number" inputMode="decimal" value={dw.amount} onChange={(e) => setDw({ ...dw, amount: e.target.value })} /></div>
-          </div>
-          <div className="fld"><label>Who took it?</label>
-            <select value={dw.who} onChange={(e) => setDw({ ...dw, who: e.target.value })}>
-              <option value={p1}>{p1}</option>
-              <option value={p2}>{p2}</option>
-            </select>
-          </div>
-          <button className="add" onClick={addDraw}>Record withdrawal</button>
+          {mode !== "draw" ? (
+            <>
+              <div className="frow">
+                <div className="fld"><label>Date &amp; time</label><input type="datetime-local" value={mv.date} onChange={(e) => setMv({ ...mv, date: e.target.value })} /></div>
+                <div className="fld"><label>Amount (€)</label><input type="number" inputMode="decimal" value={mv.amount} onChange={(e) => setMv({ ...mv, amount: e.target.value })} /></div>
+              </div>
+              <div className="fld"><label>Description</label><input value={mv.desc} onChange={(e) => setMv({ ...mv, desc: e.target.value })} placeholder="what is this for?" /></div>
+              <button className={"add " + (mode === "in" ? "btnIn" : "btnOut")} onClick={addMove}>Add {mode === "in" ? "income" : "expense"}</button>
+            </>
+          ) : (
+            <>
+              <div className="frow">
+                <div className="fld"><label>Date &amp; time</label><input type="datetime-local" value={dw.date} onChange={(e) => setDw({ ...dw, date: e.target.value })} /></div>
+                <div className="fld"><label>Amount (€)</label><input type="number" inputMode="decimal" value={dw.amount} onChange={(e) => setDw({ ...dw, amount: e.target.value })} /></div>
+              </div>
+              <div className="fld"><label>Who took it?</label>
+                <select value={dw.who} onChange={(e) => setDw({ ...dw, who: e.target.value })}>
+                  <option value={p1}>{p1}</option>
+                  <option value={p2}>{p2}</option>
+                </select>
+              </div>
+              <div className="fld"><label>Description (how was it taken?)</label><input value={dw.desc} onChange={(e) => setDw({ ...dw, desc: e.target.value })} placeholder="e.g. cash, bank transfer…" /></div>
+              <button className="add btnDraw" onClick={addDraw}>Record withdrawal</button>
+            </>
+          )}
         </div>
       </div>
 
       {/* History */}
       <div className="card">
-        <div className="card-h"><h2>History</h2></div>
+        <div className="card-h"><h2>History{filterActive ? " (filtered)" : ""}</h2></div>
         <div className="card-b">
-          {co.moves.length === 0 && co.draws.length === 0 && <div className="empty">No entries yet.</div>}
-          {co.moves.map((m) => (
-            <EditRow
-              key={m.id}
-              entry={m}
-              fields={[
-                { key: "date", label: "Date", type: "date" },
-                { key: "amount", label: "Amount (€)", type: "number" },
-                { key: "type", label: "Type", type: "select", options: [{ value: "in", label: "Income" }, { value: "out", label: "Expense" }] },
-                { key: "desc", label: "Description", type: "text" },
-              ]}
-              onSave={editMove}
-              onDelete={() => delMove(m.id)}
-              view={
-                <div>
-                  <div className="desc">{m.type === "in" ? "Income" : "Expense"}{m.desc ? " · " + m.desc : ""}</div>
-                  <div className="date">{m.date || "—"} · <span className={m.type === "in" ? "pos" : "neg"}>{m.type === "in" ? "+" : "−"}{eur(n(m.amount))}</span></div>
-                </div>
-              }
-            />
-          ))}
-          {co.draws.map((d) => (
-            <EditRow
-              key={d.id}
-              entry={d}
-              rowStyle={{ background: "#faf7f0" }}
-              fields={[
-                { key: "date", label: "Date", type: "date" },
-                { key: "amount", label: "Amount (€)", type: "number" },
-                { key: "who", label: "Who took it", type: "select", options: [{ value: p1, label: p1 }, { value: p2, label: p2 }] },
-              ]}
-              onSave={editDraw}
-              onDelete={() => delDraw(d.id)}
-              view={
-                <div>
-                  <div className="desc">Taken by {d.who}{d.note ? " · " + d.note : ""}</div>
-                  <div className="date">{d.date || "—"} · {eur(n(d.amount))}</div>
-                </div>
-              }
-            />
-          ))}
+          {filtered.length === 0 && <div className="empty">No entries{filterActive ? " for this filter" : " yet"}.</div>}
+          {filtered.map((e) =>
+            e.kind === "draw" ? (
+              <EditRow
+                key={e.id}
+                entry={e}
+                rowStyle={{ borderLeft: "4px solid #9a5bd6", background: "#faf5ff" }}
+                fields={[
+                  { key: "date", label: "Date & time", type: "datetime" },
+                  { key: "amount", label: "Amount (€)", type: "number" },
+                  { key: "who", label: "Who took it", type: "select", options: [{ value: p1, label: p1 }, { value: p2, label: p2 }] },
+                  { key: "desc", label: "Description", type: "text" },
+                ]}
+                onSave={editDraw}
+                onDelete={() => delDraw(e.id)}
+                view={
+                  <div>
+                    <div className="desc">Withdrawal · {e.who}{e.desc ? " · " + e.desc : ""}</div>
+                    <div className="date">{fmtDate(e.date)} · <span style={{ color: "#9a5bd6" }}>{eur(n(e.amount))}</span></div>
+                  </div>
+                }
+              />
+            ) : (
+              <EditRow
+                key={e.id}
+                entry={e}
+                rowStyle={{ borderLeft: "4px solid " + (e.kind === "in" ? "#1c9e63" : "#e0524a") }}
+                fields={[
+                  { key: "date", label: "Date & time", type: "datetime" },
+                  { key: "amount", label: "Amount (€)", type: "number" },
+                  { key: "type", label: "Type", type: "select", options: [{ value: "in", label: "Income" }, { value: "out", label: "Expense" }] },
+                  { key: "desc", label: "Description", type: "text" },
+                ]}
+                onSave={editMove}
+                onDelete={() => delMove(e.id)}
+                view={
+                  <div>
+                    <div className="desc">{kindLabel(e.kind)}{e.desc ? " · " + e.desc : ""}</div>
+                    <div className="date">{fmtDate(e.date)} · <span className={e.kind === "in" ? "pos" : "neg"}>{e.kind === "in" ? "+" : "−"}{eur(n(e.amount))}</span></div>
+                  </div>
+                }
+              />
+            )
+          )}
         </div>
       </div>
     </div>
@@ -531,7 +686,7 @@ function RealEstateView({ data, set }) {
         <div className="card-h"><h2>{p2} paid an installment</h2></div>
         <div className="card-b">
           <div className="frow">
-            <div className="fld"><label>Date</label><input type="date" value={mv.date} onChange={(e) => setMv({ ...mv, date: e.target.value })} /></div>
+            <div className="fld"><label>Date &amp; time</label><input type="datetime-local" value={mv.date} onChange={(e) => setMv({ ...mv, date: e.target.value })} /></div>
             <div className="fld"><label>Amount (€)</label><input type="number" inputMode="decimal" value={mv.amount} onChange={(e) => setMv({ ...mv, amount: e.target.value })} /></div>
           </div>
           <div className="frow">
@@ -547,7 +702,7 @@ function RealEstateView({ data, set }) {
         <div className="card-h"><h2>{p1} sent money to {p2}</h2></div>
         <div className="card-b">
           <div className="frow">
-            <div className="fld"><label>Date</label><input type="date" value={dw.date} onChange={(e) => setDw({ ...dw, date: e.target.value })} /></div>
+            <div className="fld"><label>Date &amp; time</label><input type="datetime-local" value={dw.date} onChange={(e) => setDw({ ...dw, date: e.target.value })} /></div>
             <div className="fld"><label>Amount (€)</label><input type="number" inputMode="decimal" value={dw.amount} onChange={(e) => setDw({ ...dw, amount: e.target.value })} /></div>
           </div>
           <div className="frow">
@@ -956,18 +1111,52 @@ function PersonalView({ data, set }) {
 
 function Overview({ data }) {
   const { p1, p2, share2 } = data.settings;
+
+  const ym = (dateStr) => {
+    if (!dateStr) return { y: "", m: "" };
+    const mm = String(dateStr).match(/^(\d{4})-(\d{2})/);
+    if (mm) return { y: mm[1], m: mm[2] };
+    return { y: "", m: "" };
+  };
+  const [oMonth, setOMonth] = useState("all");
+  const [oYear, setOYear] = useState("all");
+  const months = [
+    ["01", "January"], ["02", "February"], ["03", "March"], ["04", "April"],
+    ["05", "May"], ["06", "June"], ["07", "July"], ["08", "August"],
+    ["09", "September"], ["10", "October"], ["11", "November"], ["12", "December"],
+  ];
+  const yearsSet = new Set();
+  Object.keys(data.companies).forEach((k) => {
+    (data.companies[k].moves || []).forEach((m) => { const { y } = ym(m.date); if (y) yearsSet.add(y); });
+  });
+  const years = Array.from(yearsSet).sort().reverse();
+  const inPeriod = (dateStr) => {
+    const { y, m } = ym(dateStr);
+    if (oMonth !== "all" && m !== oMonth) return false;
+    if (oYear !== "all" && y !== oYear) return false;
+    return true;
+  };
+  const periodActive = oMonth !== "all" || oYear !== "all";
+
   let totKasse = 0, totBalP1 = 0, totBalP2 = 0;
+  let periodIncome = 0, periodExpense = 0;
   const rows = Object.keys(data.companies).map((k) => {
     const co = data.companies[k];
     if (k === "re") {
-      // Real estate: separate ledger, no cash box. Only Ahmed has a balance.
       const r = calcRE(co);
       totBalP2 += r.balP2;
-      return { name: co.name, isRE: true, balP2: r.balP2, paid: r.paidByP2, sent: r.sentToP2 };
+      return { name: co.name, isRE: true, balP2: r.balP2, paid: r.paidByP2, sent: r.sentToP2, pIn: 0, pOut: 0 };
     }
     const c = calcCompany(co, share2, p1, p2, data.debts, k);
     totKasse += c.kasse; totBalP1 += c.balP1; totBalP2 += c.balP2;
-    return { name: co.name, isRE: false, ...c };
+    // per-company income/expense for the selected period
+    let pIn = 0, pOut = 0;
+    (co.moves || []).forEach((m) => {
+      if (!inPeriod(m.date)) return;
+      if (m.type === "in") pIn += n(m.amount); else pOut += n(m.amount);
+    });
+    periodIncome += pIn; periodExpense += pOut;
+    return { name: co.name, isRE: false, pIn, pOut, ...c };
   });
   const balCls = (v) => (v > 0 ? "pos" : v < 0 ? "neg" : "");
   // debt totals from the new model
@@ -987,6 +1176,38 @@ function Overview({ data }) {
           <div className="kasse">
             <div className="lbl">Total cash (all companies)</div>
             <div className={"big mono " + (totKasse >= 0 ? "" : "neg")}>{eur(totKasse)}</div>
+          </div>
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="card-h"><h2>Monthly totals (all companies)</h2></div>
+        <div className="card-b">
+          <div className="frow">
+            <div className="fld"><label>Month</label>
+              <select value={oMonth} onChange={(e) => setOMonth(e.target.value)}>
+                <option value="all">All months</option>
+                {months.map(([v, nm]) => <option key={v} value={v}>{nm}</option>)}
+              </select>
+            </div>
+            <div className="fld"><label>Year</label>
+              <select value={oYear} onChange={(e) => setOYear(e.target.value)}>
+                <option value="all">All years</option>
+                {years.map((y) => <option key={y} value={y}>{y}</option>)}
+              </select>
+            </div>
+          </div>
+          <div className="tiles" style={{ marginBottom: 0 }}>
+            <div className="tile"><div className="tl">Income{periodActive ? " (period)" : " (all)"}</div><div className="tv pos mono">{eur(periodIncome)}</div></div>
+            <div className="tile"><div className="tl">Expense{periodActive ? " (period)" : " (all)"}</div><div className="tv neg mono">{eur(periodExpense)}</div></div>
+          </div>
+          <div style={{ marginTop: 10 }}>
+            {rows.filter((r) => !r.isRE).map((r, i) => (
+              <div className="kpi" key={i}>
+                <span className="lab">{r.name}</span>
+                <span className="val mono"><span className="pos">{eur(r.pIn)}</span> · <span className="neg">{eur(r.pOut)}</span></span>
+              </div>
+            ))}
           </div>
         </div>
       </div>
@@ -1056,16 +1277,99 @@ function Overview({ data }) {
 
 function Settings({ data, set }) {
   const s = data.settings;
+  const { p1, p2 } = s;
   const upd = (k, v) => set({ ...data, settings: { ...s, [k]: v } });
   const updName = (ck, v) =>
     set({ ...data, companies: { ...data.companies, [ck]: { ...data.companies[ck], name: v } } });
-  const exportData = () => {
-    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+
+  const download = (content, filename, type) => {
+    const blob = new Blob([content], { type });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
-    a.href = url; a.download = "partnership-backup.json"; a.click();
+    a.href = url; a.download = filename; a.click();
     URL.revokeObjectURL(url);
   };
+
+  const exportData = () => download(JSON.stringify(data, null, 2), "partnership-backup.json", "application/json");
+
+  const csvCell = (v) => {
+    const str = String(v == null ? "" : v);
+    return /[",\n]/.test(str) ? '"' + str.replace(/"/g, '""') + '"' : str;
+  };
+  const exportCSV = () => {
+    const rows = [["Company", "Type", "Date", "Amount (EUR)", "Who", "Description"]];
+    Object.keys(data.companies).forEach((ck) => {
+      const co = data.companies[ck];
+      (co.moves || []).forEach((m) =>
+        rows.push([co.name, m.type === "in" ? "Income" : "Expense", m.date || "", n(m.amount), "", m.desc || ""]));
+      (co.draws || []).forEach((d) =>
+        rows.push([co.name, "Withdrawal", d.date || "", n(d.amount), d.who || "", d.desc || ""]));
+    });
+    (data.debts || []).forEach((d) => {
+      const coNm = data.companies[d.co] ? data.companies[d.co].name : d.co;
+      rows.push([coNm, d.dir === "coOwes" ? "Debt (company owes)" : "Debt (owed to company)", d.date || "", n(d.amount), d.person || "", d.desc || ""]);
+      (d.payments || []).forEach((p) =>
+        rows.push([coNm, "Debt payment", p.date || "", n(p.amount), d.person || "", p.desc || ""]));
+    });
+    (data.personal || []).forEach((d) => {
+      rows.push(["Personal", "Personal debt", d.date || "", n(d.amount), d.from + " → " + d.to, d.desc || ""]);
+      (d.payments || []).forEach((p) =>
+        rows.push(["Personal", "Personal payment", p.date || "", n(p.amount), d.from + " → " + d.to, p.desc || ""]));
+    });
+    const csv = "\uFEFF" + rows.map((r) => r.map(csvCell).join(",")).join("\n");
+    download(csv, "partnership-report.csv", "text/csv;charset=utf-8");
+  };
+
+  const exportPDF = () => {
+    const rowsHtml = [];
+    Object.keys(data.companies).forEach((ck) => {
+      const co = data.companies[ck];
+      const all = [
+        ...(co.moves || []).map((m) => ({ t: m.type === "in" ? "Income" : "Expense", date: m.date, amount: n(m.amount), who: "", desc: m.desc, sign: m.type === "in" ? "+" : "−" })),
+        ...(co.draws || []).map((d) => ({ t: "Withdrawal", date: d.date, amount: n(d.amount), who: d.who, desc: d.desc, sign: "−" })),
+      ].sort((a, b) => String(b.date).localeCompare(String(a.date)));
+      if (all.length === 0) return;
+      rowsHtml.push('<h2>' + co.name + '</h2><table><tr><th>Date</th><th>Type</th><th>Who</th><th>Description</th><th style="text-align:right">Amount</th></tr>' +
+        all.map((r) => '<tr><td>' + (r.date || "") + '</td><td>' + r.t + '</td><td>' + (r.who || "") + '</td><td>' + (r.desc || "") + '</td><td style="text-align:right">' + r.sign + "€" + r.amount.toLocaleString("en-US", { minimumFractionDigits: 2 }) + '</td></tr>').join("") +
+        '</table>');
+    });
+    const win = window.open("", "_blank");
+    if (!win) { alert("Please allow pop-ups to export PDF."); return; }
+    win.document.write('<html><head><title>Partnership Report</title><style>' +
+      'body{font-family:Arial,sans-serif;padding:24px;color:#13233b}h1{font-size:20px}h2{font-size:15px;margin-top:22px;border-bottom:2px solid #b08322;padding-bottom:4px}' +
+      'table{width:100%;border-collapse:collapse;font-size:12px;margin-top:6px}th,td{border-bottom:1px solid #ddd;padding:6px 8px;text-align:left}th{background:#f4f1ea}' +
+      '</style></head><body><h1>Partnership Report — ' + new Date().toLocaleDateString() + '</h1>' + rowsHtml.join("") +
+      '<p style="margin-top:24px;color:#888;font-size:11px">Generated from Partnership Ledger</p></body></html>');
+    win.document.close();
+    setTimeout(() => win.print(), 400);
+  };
+
+  const importData = (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const parsed = JSON.parse(reader.result);
+        if (!parsed.companies || !parsed.settings) { alert("This doesn't look like a valid backup file."); return; }
+        if (window.confirm("Replace ALL current data with this backup? Your current data will be overwritten.")) {
+          set(mergeDefaults(parsed));
+        }
+      } catch (err) { alert("Could not read this file."); }
+    };
+    reader.readAsText(file);
+    e.target.value = "";
+  };
+
+  const [showBackups, setShowBackups] = useState(false);
+  const backups = loadBackups();
+  const restoreBackup = (snapshot) => {
+    try {
+      const parsed = JSON.parse(snapshot);
+      if (window.confirm("Restore this backup? Current data will be replaced.")) set(mergeDefaults(parsed));
+    } catch (e) { alert("Could not restore this backup."); }
+  };
+
   return (
     <div className="wrap">
       <div className="card">
@@ -1084,13 +1388,42 @@ function Settings({ data, set }) {
           ))}
         </div>
       </div>
+
       <div className="card">
-        <div className="card-h"><h2>Backup</h2></div>
+        <div className="card-h"><h2>Export & reports</h2></div>
         <div className="card-b">
-          <button className="big-btn" onClick={exportData}>Export backup file</button>
-          <div className="note">Sync is {SYNC_ON ? "ON — you and " + s.p2 + " share the same data." : "OFF (local only)."}</div>
+          <button className="big-btn" onClick={exportCSV}>Export as Excel (CSV)</button>
+          <button className="big-btn" style={{ marginTop: 8, background: "var(--brass)" }} onClick={exportPDF}>Export as PDF (print)</button>
+          <button className="big-btn" style={{ marginTop: 8, background: "var(--ink2)" }} onClick={exportData}>Export backup file (JSON)</button>
+          <div className="note">CSV opens in Excel. PDF opens a printable report you can save as PDF. JSON is a full backup you can restore below.</div>
         </div>
       </div>
+
+      <div className="card">
+        <div className="card-h"><h2>Restore & auto-backup</h2></div>
+        <div className="card-b">
+          <label className="big-btn" style={{ display: "block", textAlign: "center", background: "var(--ink)", cursor: "pointer" }}>
+            Restore from a file
+            <input type="file" accept="application/json,.json" onChange={importData} style={{ display: "none" }} />
+          </label>
+          <button className="big-btn" style={{ marginTop: 8, background: "var(--paper)", color: "var(--ink)", border: "1.5px solid var(--line)" }} onClick={() => setShowBackups(!showBackups)}>
+            {showBackups ? "Hide" : "Show"} automatic backups ({backups.length})
+          </button>
+          {showBackups && (
+            <div style={{ marginTop: 10 }}>
+              {backups.length === 0 && <div className="empty">No automatic backups yet.</div>}
+              {backups.map((b, i) => (
+                <div className="entry" key={i}>
+                  <div><div className="desc">Backup {i + 1}</div><div className="date">{new Date(b.at).toLocaleString()}</div></div>
+                  <button className="editbtn" onClick={() => restoreBackup(b.snapshot)}>Restore</button>
+                </div>
+              ))}
+            </div>
+          )}
+          <div className="note">The app keeps the last {MAX_BACKUPS} versions automatically on this device. Export a JSON file regularly for a safe off-device copy.</div>
+        </div>
+      </div>
+
       <div className="card">
         <div className="card-h"><h2>Security</h2></div>
         <div className="card-b">
