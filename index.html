@@ -1,9 +1,43 @@
+{
+  "name": "Partnership Ledger",
+  "short_name": "Partnership",
+  "description": "Private partnership accounting for Mohamed and Ahmed",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#f4f1ea",
+  "theme_color": "#13233b",
+  "icons": [
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ]
+}
+
+// Minimal service worker so the app is installable as a PWA / APK.
+const CACHE = "partnership-v1";
+self.addEventListener("install", (e) => { self.skipWaiting(); });
+self.addEventListener("activate", (e) => { self.clients.claim(); });
+self.addEventListener("fetch", (e) => {
+  // Network-first so data always stays fresh; fall back to cache if offline.
+  e.respondWith(
+    fetch(e.request).then((res) => {
+      const copy = res.clone();
+      caches.open(CACHE).then((c) => { try { c.put(e.request, copy); } catch (err) {} });
+      return res;
+    }).catch(() => caches.match(e.request))
+  );
+});
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
 <meta name="mobile-web-app-capable" content="yes" />
+<meta name="theme-color" content="#13233b" />
+<link rel="manifest" href="manifest.json" />
+<link rel="apple-touch-icon" href="icon-192.png" />
 <title>Partnership Ledger</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap" rel="stylesheet">
@@ -14,6 +48,13 @@
 </head>
 <body>
 <div id="root"></div>
+<script>
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", function () {
+    navigator.serviceWorker.register("sw.js").catch(function (e) { console.log("SW register failed", e); });
+  });
+}
+</script>
 <script type="text/babel" data-presets="react">
 const { useState, useEffect, useMemo } = React;
 
