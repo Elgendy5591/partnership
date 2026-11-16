@@ -32,6 +32,9 @@ const { useState, useEffect, useMemo } = React;
 
 
 
+
+
+
 /* =========================================================================
    Partnership Tracker v2 — Mohamed (80%) & Ahmed (20%)
    Each company: Einnahmen (income), Ausgaben (expenses), Kasse (cash),
@@ -149,6 +152,9 @@ const n = (v) => (isNaN(parseFloat(v)) ? 0 : parseFloat(v));
 const eur = (v) =>
   (v < 0 ? "-" : "") + "€" +
   Math.abs(v).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const egp = (v) =>
+  (v < 0 ? "-" : "") +
+  Math.abs(v).toLocaleString("en-US", { maximumFractionDigits: 0 }) + " ج.م";
 
 // Show a date, plus time if the stored value includes one (datetime-local: YYYY-MM-DDTHH:MM)
 const fmtDate = (s) => {
@@ -326,15 +332,22 @@ function calcCompany(co, share2, p1, p2, debts, ckey) {
   // debt payments touching THIS company's Kasse:
   //  - company paying back what it owes  -> money leaves  (−)
   //  - someone paying back the company    -> money comes in (+)
+  // each payment is charged to the company that MADE it (p.payCo), falling
+  // back to the debt's own company for older payments with no payCo.
   let kasseDebtEffect = 0;
   (debts || []).forEach((d) => {
-    if (d.co !== ckey) return;
-    const paid = (d.payments || []).reduce((s, p) => s + n(p.amount), 0);
-    if (d.dir === "coOwes") kasseDebtEffect -= paid;
-    else if (d.dir === "owesCo") kasseDebtEffect += paid;
+    (d.payments || []).forEach((p) => {
+      const payCo = p.payCo || d.co;
+      if (payCo !== ckey) return;
+      const amt = n(p.amount);
+      if (d.dir === "coOwes") kasseDebtEffect -= amt;
+      else if (d.dir === "owesCo") kasseDebtEffect += amt;
+    });
   });
-  const repaid = -kasseDebtEffect; // for display: positive means net money left
-  const kasse = net - totalDraw + kasseDebtEffect;
+  const repaid = -kasseDebtEffect; // for display only
+  // الديون منفصلة تمامًا عن الكاسة. الكاسة = دخل − مصروف − سحب بس.
+  // (تسديد الدين بيتسجّل مصروف عادي في الشركة، فمفيش خصم مزدوج)
+  const kasse = net - totalDraw;
   const dueP1 = net * (1 - share2);                // نصيب محمد المستحق
   const dueP2 = net * share2;                       // نصيب أحمد المستحق
   const balP1 = drawP1 - dueP1;                     // + واخد زيادة / - لسه ليه
@@ -347,12 +360,14 @@ function calcCompany(co, share2, p1, p2, debts, ckey) {
        EGP amount + rate are optional notes for documentation only —
        they do NOT affect any calculation.  ---- */
 function calcRE(co) {
-  let paidByP2 = 0;
-  co.moves.forEach((m) => { paidByP2 += n(m.amount); });
-  let sentToP2 = 0;
-  co.draws.forEach((d) => { sentToP2 += n(d.amount); });
-  const balP2 = sentToP2 - paidByP2;   // − لسه ليه / + اتسلم زيادة
-  return { paidByP2, sentToP2, balP2 };
+  // العقار أساسه الجنيه المصري (egp). اليورو (amount) للتوثيق فقط.
+  let paidByP2 = 0, paidEur = 0;      // أحمد دفع (جنيه + يورو توثيق)
+  co.moves.forEach((m) => { paidByP2 += n(m.egp); paidEur += n(m.amount); });
+  let sentToP2 = 0, sentEur = 0;      // محمد رجّع (جنيه + يورو توثيق)
+  co.draws.forEach((d) => { sentToP2 += n(d.egp); sentEur += n(d.amount); });
+  const balP2 = sentToP2 - paidByP2;  // بالجنيه: − لسه ليه / + اتسلم زيادة
+  const balEur = sentEur - paidEur;   // باليورو (توثيق)
+  return { paidByP2, sentToP2, balP2, paidEur, sentEur, balEur };
 }
 
 /* ------------------------------ Components ------------------------------ */
@@ -465,6 +480,28 @@ function CompanyView({ ckey, data, set }) {
       },
     });
     setTr({ date: "", to: otherCos[0] || "", amount: "", desc: "" });
+  };
+
+  // سدّد دين على الشركات من كاسة الشركة دي
+  const debtRem = (d) => n(d.amount) - (d.payments || []).reduce((s, p) => s + n(p.amount), 0);
+  const openCoDebts = (data.debts || []).filter((d) => d.dir === "coOwes" && debtRem(d) > 0.5);
+  const [dp, setDp] = useState({ debtId: openCoDebts[0] ? openCoDebts[0].id : "", date: "", amount: "", desc: "" });
+  const payCompanyDebt = () => {
+    if (!dp.debtId || !dp.amount) return;
+    const theDebt = (data.debts || []).find((d) => d.id === dp.debtId);
+    const personName = theDebt ? theDebt.person : "";
+    // 1) مصروف في الشركة (يخصم من الكاسة مرة واحدة)
+    const expense = { id: uid(), type: "out", date: dp.date, amount: dp.amount, desc: "سداد دين: " + personName + (dp.desc ? " · " + dp.desc : "") };
+    // 2) دفعة في الدين (للمتابعة، الديون منفصلة فمش هتأثر على الكاسة تاني)
+    const payment = { id: uid(), date: dp.date, amount: dp.amount, desc: dp.desc, payCo: ckey };
+    set({
+      ...data,
+      companies: { ...data.companies, [ckey]: { ...co, moves: [expense, ...co.moves] } },
+      debts: (data.debts || []).map((d) =>
+        d.id === dp.debtId ? { ...d, payments: [payment, ...(d.payments || [])] } : d
+      ),
+    });
+    setDp({ debtId: "", date: "", amount: "", desc: "" });
   };
 
   const balClass = (v) => (Math.abs(v) < 0.005 ? "z" : v > 0 ? "p" : "n");
@@ -615,6 +652,32 @@ function CompanyView({ ckey, data, set }) {
         </div>
       )}
 
+      {/* سدّد دين على الشركات من كاسة الشركة دي */}
+      {openCoDebts.length > 0 && (
+        <div className="card" dir="rtl">
+          <div className="card-h"><h2>سدّد دين من كاسة {co.name}</h2></div>
+          <div className="card-b">
+            <div className="note" style={{ marginTop: 0 }}>
+              لو الشركة دي عندها كاش وسدّدت دين على الشركات، سجّله هنا. المبلغ هيتخصم من كاسة {co.name} ويتسجّل في الدين إنه اتدفع من هنا.
+            </div>
+            <div className="fld"><label>اختار الدين</label>
+              <select value={dp.debtId} onChange={(e) => setDp({ ...dp, debtId: e.target.value })}>
+                <option value="">— اختار —</option>
+                {openCoDebts.map((d) => (
+                  <option key={d.id} value={d.id}>{d.person} — باقي {eur(debtRem(d))}{d.desc ? " (" + d.desc.slice(0, 25) + ")" : ""}</option>
+                ))}
+              </select>
+            </div>
+            <div className="frow">
+              <div className="fld"><label>التاريخ</label><input type="date" value={dp.date} onChange={(e) => setDp({ ...dp, date: e.target.value })} /></div>
+              <div className="fld"><label>المبلغ (€)</label><input type="number" inputMode="decimal" value={dp.amount} onChange={(e) => setDp({ ...dp, amount: e.target.value })} /></div>
+            </div>
+            <div className="fld"><label>ملاحظة (اختياري)</label><input value={dp.desc} onChange={(e) => setDp({ ...dp, desc: e.target.value })} placeholder="تفاصيل التسديد" /></div>
+            <button className="add" style={{ background: "#e0524a" }} onClick={payCompanyDebt}>سجّل التسديد</button>
+          </div>
+        </div>
+      )}
+
       {/* History */}
       <div className="card">
         <div className="card-h"><h2>History{filterActive ? " (filtered)" : ""}</h2></div>
@@ -674,20 +737,21 @@ function RealEstateView({ data, set }) {
   const { p1, p2 } = data.settings;
   const c = calcRE(co);
 
-  const [mv, setMv] = useState({ date: "", desc: "", amount: "", egp: "", rate: "" });
-  const [dw, setDw] = useState({ date: "", amount: "", egp: "", rate: "", desc: "" });
+  // الأساس بالجنيه المصري (egp). اليورو (amount) + سعر الصرف (rate) للتوثيق فقط.
+  const [mv, setMv] = useState({ date: "", desc: "", egp: "", amount: "", rate: "" });
+  const [dw, setDw] = useState({ date: "", egp: "", amount: "", rate: "", desc: "" });
 
   const addPaid = () => {
-    if (!mv.amount) return;
+    if (!mv.egp) return;
     const co2 = { ...co, moves: [{ id: uid(), type: "in", ...mv }, ...co.moves] };
     set({ ...data, companies: { ...data.companies, re: co2 } });
-    setMv({ date: "", desc: "", amount: "", egp: "", rate: mv.rate });
+    setMv({ date: "", desc: "", egp: "", amount: "", rate: mv.rate });
   };
   const addSent = () => {
-    if (!dw.amount) return;
+    if (!dw.egp) return;
     const co2 = { ...co, draws: [{ id: uid(), who: p2, ...dw }, ...co.draws] };
     set({ ...data, companies: { ...data.companies, re: co2 } });
-    setDw({ date: "", amount: "", egp: "", rate: dw.rate, desc: "" });
+    setDw({ date: "", egp: "", amount: "", rate: dw.rate, desc: "" });
   };
   const delMove = (id) =>
     set({ ...data, companies: { ...data.companies, re: { ...co, moves: co.moves.filter((m) => m.id !== id) } } });
@@ -698,99 +762,101 @@ function RealEstateView({ data, set }) {
   const editDraw = (patch) =>
     set({ ...data, companies: { ...data.companies, re: { ...co, draws: co.draws.map((d) => (d.id === patch.id ? patch : d)) } } });
 
-  const remaining = Math.max(0, -c.balP2);
-  const balCls = Math.abs(c.balP2) < 0.005 ? "z" : c.balP2 > 0 ? "p" : "n";
-  const balState = Math.abs(c.balP2) < 0.005 ? "Settled" : c.balP2 > 0 ? "Got extra (+)" : "Still owed (−)";
+  const remaining = Math.max(0, -c.balP2);  // بالجنيه
+  const balState = Math.abs(c.balP2) < 0.5 ? "مسوّى" : c.balP2 > 0 ? "اتسلّم زيادة" : "لسه ليه";
 
   return (
-    <div className="wrap">
+    <div className="wrap" dir="rtl">
       <div className="card">
         <div className="card-b">
           <div className="kasse">
-            <div className="lbl">{p1} still owes {p2}</div>
-            <div className={"big mono " + (remaining > 0 ? "neg" : "")}>{eur(remaining)}</div>
+            <div className="lbl">{p1} لسه عليه لـ {p2} (بالمصري)</div>
+            <div className={"big mono " + (remaining > 0 ? "neg" : "")}>{egp(remaining)}</div>
           </div>
           <div className="split">
-            <div className="col"><div className="t">{p2} paid</div><div className="v mono">{eur(c.paidByP2)}</div></div>
-            <div className="col"><div className="t">{p1} sent back</div><div className="v mono">{eur(c.sentToP2)}</div></div>
-            <div className="col"><div className="t">Balance</div><div className={"v mono " + (c.balP2 > 0 ? "pos" : c.balP2 < 0 ? "neg" : "")}>{eur(c.balP2)}</div></div>
+            <div className="col"><div className="t">{p2} دفع</div><div className="v mono">{egp(c.paidByP2)}</div></div>
+            <div className="col"><div className="t">{p1} وصّله</div><div className="v mono">{egp(c.sentToP2)}</div></div>
+            <div className="col"><div className="t">الباقي</div><div className={"v mono " + (c.balP2 > 0 ? "pos" : c.balP2 < 0 ? "neg" : "")}>{egp(c.balP2)}</div></div>
+          </div>
+          <div className="note" style={{ textAlign: "center", marginTop: 6 }}>
+            باليورو (توثيق): {p2} دفع {eur(c.paidEur)} · {p1} وصّله {eur(c.sentEur)}
           </div>
         </div>
       </div>
 
       <div className="card">
-        <div className="card-h"><h2>Balance</h2></div>
+        <div className="card-h"><h2>الباقي لـ {p2}</h2></div>
         <div className="card-b">
-          <div className={"bal " + balCls}>
+          <div className={"bal " + (Math.abs(c.balP2) < 0.5 ? "z" : c.balP2 > 0 ? "p" : "n")}>
             <div>
               <div className="who">{p2}</div>
-              <div className="st">Paid {eur(c.paidByP2)} · Received {eur(c.sentToP2)} · {balState}</div>
+              <div className="st">دفع {egp(c.paidByP2)} · اتسلّم {egp(c.sentToP2)} · {balState}</div>
             </div>
-            <div className={"amt mono " + (c.balP2 > 0 ? "pos" : c.balP2 < 0 ? "neg" : "")}>{eur(c.balP2)}</div>
+            <div className={"amt mono " + (c.balP2 > 0 ? "pos" : c.balP2 < 0 ? "neg" : "")}>{egp(c.balP2)}</div>
           </div>
           <div className="note">
-            {p2} pays the property installments from his own pocket. {p1} pays him back the same amount in €.
-            The EGP amount and rate are optional — recorded for your reference only, they don't affect the balance.
-            <br />− means {p1} still owes him · + means he received more · 0 means settled.
+            {p2} بيدفع أقساط العقار من جيبه بالمصري. {p1} بيرجّعله نفس المبلغ بالمصري.
+            خانة اليورو وسعر الصرف اختياريين — للتوثيق بس (اتوصّله كام يورو)، وملهومش علاقة بالحساب.
+            <br />ده حساب منفصل تمامًا عن الشركات.
           </div>
         </div>
       </div>
 
       <div className="card">
-        <div className="card-h"><h2>{p2} paid an installment</h2></div>
+        <div className="card-h"><h2>{p2} دفع قسط</h2></div>
         <div className="card-b">
           <div className="frow">
-            <div className="fld"><label>Date &amp; time</label><input type="datetime-local" value={mv.date} onChange={(e) => setMv({ ...mv, date: e.target.value })} /></div>
-            <div className="fld"><label>Amount (€)</label><input type="number" inputMode="decimal" value={mv.amount} onChange={(e) => setMv({ ...mv, amount: e.target.value })} /></div>
+            <div className="fld"><label>التاريخ</label><input type="datetime-local" value={mv.date} onChange={(e) => setMv({ ...mv, date: e.target.value })} /></div>
+            <div className="fld"><label>المبلغ (ج.م)</label><input type="number" inputMode="decimal" value={mv.egp} onChange={(e) => setMv({ ...mv, egp: e.target.value })} placeholder="القسط بالجنيه" /></div>
           </div>
           <div className="frow">
-            <div className="fld"><label>EGP paid (optional)</label><input type="number" inputMode="decimal" value={mv.egp} onChange={(e) => setMv({ ...mv, egp: e.target.value })} placeholder="for the record" /></div>
-            <div className="fld"><label>Rate that day (optional)</label><input type="number" inputMode="decimal" value={mv.rate} onChange={(e) => setMv({ ...mv, rate: e.target.value })} placeholder="1 € = ?" /></div>
+            <div className="fld"><label>اتوصّله كام يورو؟ (اختياري)</label><input type="number" inputMode="decimal" value={mv.amount} onChange={(e) => setMv({ ...mv, amount: e.target.value })} placeholder="للتوثيق" /></div>
+            <div className="fld"><label>سعر الصرف (اختياري)</label><input type="number" inputMode="decimal" value={mv.rate} onChange={(e) => setMv({ ...mv, rate: e.target.value })} placeholder="1 € = ؟" /></div>
           </div>
-          <div className="fld"><label>Description</label><input value={mv.desc} onChange={(e) => setMv({ ...mv, desc: e.target.value })} placeholder="optional" /></div>
-          <button className="add" onClick={addPaid}>Add installment</button>
+          <div className="fld"><label>ملاحظة</label><input value={mv.desc} onChange={(e) => setMv({ ...mv, desc: e.target.value })} placeholder="اختياري" /></div>
+          <button className="add" onClick={addPaid}>أضف القسط</button>
         </div>
       </div>
 
       <div className="card">
-        <div className="card-h"><h2>{p1} sent money to {p2}</h2></div>
+        <div className="card-h"><h2>{p1} وصّل فلوس لـ {p2}</h2></div>
         <div className="card-b">
           <div className="frow">
-            <div className="fld"><label>Date &amp; time</label><input type="datetime-local" value={dw.date} onChange={(e) => setDw({ ...dw, date: e.target.value })} /></div>
-            <div className="fld"><label>Amount (€)</label><input type="number" inputMode="decimal" value={dw.amount} onChange={(e) => setDw({ ...dw, amount: e.target.value })} /></div>
+            <div className="fld"><label>التاريخ</label><input type="datetime-local" value={dw.date} onChange={(e) => setDw({ ...dw, date: e.target.value })} /></div>
+            <div className="fld"><label>المبلغ (ج.م)</label><input type="number" inputMode="decimal" value={dw.egp} onChange={(e) => setDw({ ...dw, egp: e.target.value })} placeholder="اللي وصله بالجنيه" /></div>
           </div>
           <div className="frow">
-            <div className="fld"><label>EGP received (optional)</label><input type="number" inputMode="decimal" value={dw.egp} onChange={(e) => setDw({ ...dw, egp: e.target.value })} placeholder="for the record" /></div>
-            <div className="fld"><label>Rate that day (optional)</label><input type="number" inputMode="decimal" value={dw.rate} onChange={(e) => setDw({ ...dw, rate: e.target.value })} placeholder="1 € = ?" /></div>
+            <div className="fld"><label>اتوصّله كام يورو؟ (اختياري)</label><input type="number" inputMode="decimal" value={dw.amount} onChange={(e) => setDw({ ...dw, amount: e.target.value })} placeholder="للتوثيق" /></div>
+            <div className="fld"><label>سعر الصرف (اختياري)</label><input type="number" inputMode="decimal" value={dw.rate} onChange={(e) => setDw({ ...dw, rate: e.target.value })} placeholder="1 € = ؟" /></div>
           </div>
-          <div className="fld"><label>How did the money reach him? (description)</label><input value={dw.desc} onChange={(e) => setDw({ ...dw, desc: e.target.value })} placeholder="e.g. bank transfer, cash, via someone…" /></div>
-          <button className="add" onClick={addSent}>Record payment</button>
+          <div className="fld"><label>وصلته إزاي؟</label><input value={dw.desc} onChange={(e) => setDw({ ...dw, desc: e.target.value })} placeholder="تحويل بنكي، كاش، عن طريق حد…" /></div>
+          <button className="add" onClick={addSent}>سجّل التوصيل</button>
         </div>
       </div>
 
       <div className="card">
-        <div className="card-h"><h2>History</h2></div>
+        <div className="card-h"><h2>السجل</h2></div>
         <div className="card-b">
-          {co.moves.length === 0 && co.draws.length === 0 && <div className="empty">No entries yet.</div>}
+          {co.moves.length === 0 && co.draws.length === 0 && <div className="empty">لا يوجد حركات.</div>}
           {co.moves.map((m) => (
             <EditRow
               key={m.id}
               entry={m}
               fields={[
-                { key: "date", label: "Date", type: "date" },
-                { key: "amount", label: "Amount (€)", type: "number" },
-                { key: "egp", label: "EGP (optional)", type: "number" },
-                { key: "rate", label: "Rate (optional)", type: "number" },
-                { key: "desc", label: "Description", type: "text" },
+                { key: "date", label: "التاريخ", type: "datetime" },
+                { key: "egp", label: "المبلغ (ج.م)", type: "number" },
+                { key: "amount", label: "يورو (اختياري)", type: "number" },
+                { key: "rate", label: "سعر الصرف (اختياري)", type: "number" },
+                { key: "desc", label: "ملاحظة", type: "text" },
               ]}
               onSave={editMove}
               onDelete={() => delMove(m.id)}
               view={
                 <div>
-                  <div className="desc">{p2} paid{m.desc ? " · " + m.desc : ""}</div>
+                  <div className="desc">{p2} دفع{m.desc ? " · " + m.desc : ""}</div>
                   <div className="date">
-                    {m.date || "—"} · {eur(n(m.amount))}
-                    {n(m.egp) > 0 ? " · " + n(m.egp).toLocaleString() + " EGP" : ""}
+                    {fmtDate(m.date)} · {egp(n(m.egp))}
+                    {n(m.amount) > 0 ? " · (" + eur(n(m.amount)) + ")" : ""}
                     {n(m.rate) > 0 ? " @ " + n(m.rate) : ""}
                   </div>
                 </div>
@@ -803,20 +869,20 @@ function RealEstateView({ data, set }) {
               entry={d}
               rowStyle={{ background: "#faf7f0" }}
               fields={[
-                { key: "date", label: "Date", type: "date" },
-                { key: "amount", label: "Amount (€)", type: "number" },
-                { key: "egp", label: "EGP (optional)", type: "number" },
-                { key: "rate", label: "Rate (optional)", type: "number" },
-                { key: "desc", label: "How money reached him", type: "text" },
+                { key: "date", label: "التاريخ", type: "datetime" },
+                { key: "egp", label: "المبلغ (ج.م)", type: "number" },
+                { key: "amount", label: "يورو (اختياري)", type: "number" },
+                { key: "rate", label: "سعر الصرف (اختياري)", type: "number" },
+                { key: "desc", label: "وصلته إزاي", type: "text" },
               ]}
               onSave={editDraw}
               onDelete={() => delDraw(d.id)}
               view={
                 <div>
-                  <div className="desc">{p1} sent to {p2}{d.desc ? " · " + d.desc : ""}</div>
+                  <div className="desc">{p1} وصّل لـ {p2}{d.desc ? " · " + d.desc : ""}</div>
                   <div className="date">
-                    {d.date || "—"} · {eur(n(d.amount))}
-                    {n(d.egp) > 0 ? " · " + n(d.egp).toLocaleString() + " EGP" : ""}
+                    {fmtDate(d.date)} · {egp(n(d.egp))}
+                    {n(d.amount) > 0 ? " · (" + eur(n(d.amount)) + ")" : ""}
                     {n(d.rate) > 0 ? " @ " + n(d.rate) : ""}
                   </div>
                 </div>
@@ -899,6 +965,18 @@ function DebtsView({ data, set }) {
     else owesCoTotal += rem;
   });
 
+  // ملخص لكل شخص: الشركات مدينة له كام، وهو مدين للشركات كام
+  const byPerson = {};
+  (data.debts || []).forEach((d) => {
+    const rem = debtRemaining(d);
+    if (rem < 0.5) return;
+    if (!byPerson[d.person]) byPerson[d.person] = { owedToThem: 0, theyOwe: 0 };
+    if (d.dir === "coOwes") byPerson[d.person].owedToThem += rem;
+    else byPerson[d.person].theyOwe += rem;
+  });
+  const owedList = Object.entries(byPerson).filter(([, v]) => v.owedToThem > 0.5);
+  const oweList = Object.entries(byPerson).filter(([, v]) => v.theyOwe > 0.5);
+
   const dirLabel = (d) => (d.dir === "coOwes" ? coName(d.co) + " owes " + d.person : d.person + " owes " + coName(d.co));
 
   return (
@@ -912,6 +990,28 @@ function DebtsView({ data, set }) {
             Pick a direction for each debt. Repayments move money in or out of the
             chosen company's Kasse. You can pay in parts — the remaining shows below.
           </div>
+        </div>
+      </div>
+
+      <div className="card" dir="rtl">
+        <div className="card-h"><h2>ملخص الديون — مين له ومين عليه</h2></div>
+        <div className="card-b">
+          <div style={{ fontWeight: 800, fontSize: 13, color: "#e0524a", marginBottom: 6 }}>الشركات مدينة لـ (علينا ندفع):</div>
+          {owedList.length === 0 && <div className="empty">لا يوجد</div>}
+          {owedList.map(([person, v]) => (
+            <div className="kpi" key={"owed" + person}>
+              <span className="lab">{person}</span>
+              <span className="val mono neg">{eur(v.owedToThem)}</span>
+            </div>
+          ))}
+          <div style={{ fontWeight: 800, fontSize: 13, color: "#1c9e63", margin: "12px 0 6px" }}>مدينين للشركات (لنا عندهم):</div>
+          {oweList.length === 0 && <div className="empty">لا يوجد</div>}
+          {oweList.map(([person, v]) => (
+            <div className="kpi" key={"owe" + person}>
+              <span className="lab">{person}</span>
+              <span className="val mono pos">{eur(v.theyOwe)}</span>
+            </div>
+          ))}
         </div>
       </div>
 
@@ -964,13 +1064,17 @@ function DebtsView({ data, set }) {
                     <div className="desc">{dirLabel(d)}{d.desc ? " · " + d.desc : ""}</div>
                     <div className="date">{d.date || "—"} · amount {eur(n(d.amount))} · paid {eur(paid)}</div>
                   </div>
-                  <div className={"amt mono " + (done ? "pos" : "neg")}>{done ? "Settled" : eur(rem)}</div>
+                  <div style={{ textAlign: "right" }}>
+                    {done
+                      ? <div className="amt mono pos">مسدّد بالكامل ✓</div>
+                      : <div className="amt mono neg">باقي {eur(rem)}</div>}
+                  </div>
                 </div>
                 {(d.payments || []).length > 0 && (
                   <div style={{ marginTop: 8, paddingLeft: 8, borderLeft: "2px solid var(--line)" }}>
                     {(d.payments || []).map((p) => (
                       <div key={p.id} style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, color: "var(--ink2)", padding: "3px 0" }}>
-                        <span>{p.date || "—"}{p.desc ? " · " + p.desc : ""}</span>
+                        <span>{p.date || "—"}{p.payCo && data.companies[p.payCo] ? " · من " + data.companies[p.payCo].name : ""}{p.desc ? " · " + p.desc : ""}</span>
                         <span style={{ display: "flex", gap: 8 }}>
                           <span className="mono">{eur(n(p.amount))}</span>
                           <button className="removebtn" style={{ fontSize: 12 }} onClick={() => { if (window.confirm("Remove this payment?")) delPayment(d.id, p.id); }}>remove</button>
@@ -1057,14 +1161,27 @@ function PersonalView({ data, set }) {
       ),
     });
 
-  // net between the two partners specifically (informational)
-  let p1ToP2 = 0, p2ToP1 = 0;
+  // ملخص: صافي الدين بين كل شخصين (نجمع الاتجاهين ونطرح)
+  const pairMap = {};
   (data.personal || []).forEach((d) => {
     const rem = n(d.amount) - (d.payments || []).reduce((s, p) => s + n(p.amount), 0);
-    if (d.from === p1 && d.to === p2) p1ToP2 += rem;
-    else if (d.from === p2 && d.to === p1) p2ToP1 += rem;
+    if (rem < 0.5) return;
+    // مفتاح موحّد للزوج بغض النظر عن الاتجاه
+    const key = [d.from, d.to].sort().join("|||");
+    if (!pairMap[key]) pairMap[key] = {};
+    pairMap[key][d.from] = (pairMap[key][d.from] || 0) + rem;
   });
-  const net = p2ToP1 - p1ToP2; // positive => p1 owes p2 net... keep simple below
+  const netPairs = [];
+  Object.entries(pairMap).forEach(([key, sides]) => {
+    const [a, b] = key.split("|||");
+    const aOwes = sides[a] || 0; // a دفع لـ b (يعني b مدين لـ a) — from owes to، فـ from=a معناه a مدين لـ b
+    const bOwes = sides[b] || 0;
+    // from owes to: لو from=a، يبقى a مدين لـ b
+    const net = aOwes - bOwes;
+    if (Math.abs(net) < 0.5) return;
+    if (net > 0) netPairs.push({ who: a, to: b, amount: net });
+    else netPairs.push({ who: b, to: a, amount: -net });
+  });
 
   return (
     <div className="wrap">
@@ -1075,6 +1192,19 @@ function PersonalView({ data, set }) {
             Private money between any people — not connected to the companies' Kasse.
             "A owes B". Pay in parts; the remaining updates automatically.
           </div>
+        </div>
+      </div>
+
+      <div className="card" dir="rtl">
+        <div className="card-h"><h2>ملخص — مين مدين لمين</h2></div>
+        <div className="card-b">
+          {netPairs.length === 0 && <div className="empty">كله مسوّى</div>}
+          {netPairs.map((p, i) => (
+            <div className="kpi" key={i}>
+              <span className="lab">{p.who} مدين لـ {p.to}</span>
+              <span className="val mono neg">{eur(p.amount)}</span>
+            </div>
+          ))}
         </div>
       </div>
 
@@ -1193,12 +1323,13 @@ function Overview({ data }) {
   const periodActive = oMonth !== "all" || oYear !== "all";
 
   let totKasse = 0, totBalP1 = 0, totBalP2 = 0;
+  let reBalP2 = 0; // رصيد العقار منفصل — مالوش علاقة بكاسة الشركات
   let periodIncome = 0, periodExpense = 0;
   const rows = Object.keys(data.companies).map((k) => {
     const co = data.companies[k];
     if (k === "re") {
       const r = calcRE(co);
-      totBalP2 += r.balP2;
+      reBalP2 += r.balP2; // منفصل، مش داخل في totBalP2
       return { name: co.name, isRE: true, balP2: r.balP2, paid: r.paidByP2, sent: r.sentToP2, pIn: 0, pOut: 0 };
     }
     const c = calcCompany(co, share2, p1, p2, data.debts, k);
@@ -1266,7 +1397,7 @@ function Overview({ data }) {
         </div>
       </div>
       <div className="card">
-        <div className="card-h"><h2>Total balances</h2></div>
+        <div className="card-h"><h2>Total balances (companies)</h2></div>
         <div className="card-b">
           <div className={"bal " + (Math.abs(totBalP1) < 0.005 ? "z" : totBalP1 > 0 ? "p" : "n")}>
             <div><div className="who">{p1}</div><div className="st">{Math.abs(totBalP1) < 0.005 ? "Settled" : totBalP1 > 0 ? "Took extra (+)" : "Still owed (−)"}</div></div>
@@ -1276,8 +1407,22 @@ function Overview({ data }) {
             <div><div className="who">{p2}</div><div className="st">{Math.abs(totBalP2) < 0.005 ? "Settled" : totBalP2 > 0 ? "Took extra (+)" : "Still owed (−)"}</div></div>
             <div className={"amt mono " + balCls(totBalP2)}>{eur(totBalP2)}</div>
           </div>
+          <div className="note">مجموع الرصيدين = الكاسة الكلية ({eur(totKasse)}). العقار محسوب لوحده تحت.</div>
         </div>
       </div>
+
+      {Math.abs(reBalP2) > 0.005 && (
+        <div className="card" dir="rtl">
+          <div className="card-h"><h2>العقار (Isla) — منفصل عن الشركات</h2></div>
+          <div className="card-b">
+            <div className={"bal " + (Math.abs(reBalP2) < 0.5 ? "z" : reBalP2 > 0 ? "p" : "n")}>
+              <div><div className="who">{p2}</div><div className="st">{Math.abs(reBalP2) < 0.5 ? "مسوّى" : reBalP2 < 0 ? "لسه ليه في العقار" : "اتسلّم زيادة"}</div></div>
+              <div className={"amt mono " + balCls(reBalP2)}>{egp(reBalP2)}</div>
+            </div>
+            <div className="note">ده حساب العقار لوحده بالمصري، مالوش علاقة بكاسة الشركات.</div>
+          </div>
+        </div>
+      )}
       <div className="card">
         <div className="card-h"><h2>Per company</h2></div>
         <div className="card-b">
@@ -1286,7 +1431,7 @@ function Overview({ data }) {
               <span className="lab">{r.name}</span>
               {r.isRE ? (
                 <span className={"val mono " + balCls(r.balP2)}>
-                  {Math.abs(r.balP2) < 0.005 ? "Settled" : eur(r.balP2)}
+                  {Math.abs(r.balP2) < 0.5 ? "مسوّى" : egp(r.balP2)}
                 </span>
               ) : (
                 <span className="val mono">Kasse {eur(r.kasse)}</span>
@@ -1659,39 +1804,12 @@ function App() {
 
 
 
+
+
+
+
 const root = ReactDOM.createRoot(document.getElementById("root"));
 root.render(<App />);
 </script>
 </body>
 </html>
-
-{
-  "name": "Partnership Ledger",
-  "short_name": "Partnership",
-  "description": "Private partnership accounting for Mohamed and Ahmed",
-  "start_url": "./index.html",
-  "scope": "./",
-  "display": "standalone",
-  "orientation": "portrait",
-  "background_color": "#f4f1ea",
-  "theme_color": "#13233b",
-  "icons": [
-    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" },
-    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
-  ]
-}
-
-// Minimal service worker so the app is installable as a PWA / APK.
-const CACHE = "partnership-v1";
-self.addEventListener("install", (e) => { self.skipWaiting(); });
-self.addEventListener("activate", (e) => { self.clients.claim(); });
-self.addEventListener("fetch", (e) => {
-  // Network-first so data always stays fresh; fall back to cache if offline.
-  e.respondWith(
-    fetch(e.request).then((res) => {
-      const copy = res.clone();
-      caches.open(CACHE).then((c) => { try { c.put(e.request, copy); } catch (err) {} });
-      return res;
-    }).catch(() => caches.match(e.request))
-  );
-});
